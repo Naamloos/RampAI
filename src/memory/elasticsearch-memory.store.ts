@@ -1,9 +1,13 @@
+import { createHash } from 'node:crypto';
+
 interface SearchHit {
   _id: string;
   _score?: number;
   _source?: {
     text?: string;
     updatedAt?: string;
+    fingerprint?: string;
+    reinforcementCount?: number;
   };
 }
 
@@ -16,10 +20,13 @@ export interface MemorySearchResult {
 
 export default class ElasticsearchMemoryStore {
   private readonly index = process.env.ELASTICSEARCH_INDEX ?? 'rampai_memories';
+
   private readonly url = (process.env.ELASTICSEARCH_URL ?? 'http://localhost:9200').replace(
     /\/$/,
     '',
   );
+  private readonly authorization = this.buildAuthorization();
+  private indexReady?: Promise<void>;
 
   async search(query: string, limit = 5): Promise<MemorySearchResult[]> {
     await this.ensureIndex();
@@ -83,9 +90,40 @@ export default class ElasticsearchMemoryStore {
     await this.ensureIndex();
 
     const now = new Date().toISOString();
+    const fingerprint = createHash('sha256')
+      .update(text.toLocaleLowerCase().replace(/\s+/g, ' ').trim())
+      .digest('hex');
+    const duplicate = await this.request<{ hits?: { hits?: SearchHit[] } }>(
+      `/${this.index}/_search`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ size: 1, query: { term: { fingerprint } } }),
+      },
+    );
+    const existing = duplicate.hits?.hits?.[0];
+    if (existing) {
+      await this.request(`/${this.index}/_update/${encodeURIComponent(existing._id)}`, {
+        method: 'POST',
+        body: JSON.stringify({
+          script: {
+            source:
+              'ctx._source.reinforcementCount = (ctx._source.reinforcementCount ?: 1) + 1; ctx._source.updatedAt = params.now',
+            params: { now },
+          },
+        }),
+      });
+      return existing._id;
+    }
+
     const response = await this.request<{ _id: string }>(`/${this.index}/_doc`, {
       method: 'POST',
-      body: JSON.stringify({ text, createdAt: now, updatedAt: now }),
+      body: JSON.stringify({
+        text,
+        createdAt: now,
+        updatedAt: now,
+        fingerprint,
+        reinforcementCount: 1,
+      }),
     });
 
     return response._id;
@@ -100,6 +138,9 @@ export default class ElasticsearchMemoryStore {
         body: JSON.stringify({
           doc: {
             text,
+            fingerprint: createHash('sha256')
+              .update(text.toLocaleLowerCase().replace(/\s+/g, ' ').trim())
+              .digest('hex'),
             updatedAt: new Date().toISOString(),
           },
         }),
@@ -132,9 +173,36 @@ export default class ElasticsearchMemoryStore {
   }
 
   async ensureIndex(): Promise<void> {
-    const exists = await fetch(`${this.url}/${this.index}`, { method: 'HEAD' });
+    if (!this.indexReady) {
+      this.indexReady = this.createIndexIfMissing().catch((error) => {
+        this.indexReady = undefined;
+        throw error;
+      });
+    }
+    await this.indexReady;
+  }
+
+  private async createIndexIfMissing(): Promise<void> {
+    const exists = await fetch(`${this.url}/${this.index}`, {
+      method: 'HEAD',
+      headers: this.headers(),
+      signal: AbortSignal.timeout(10_000),
+    });
+
     if (exists.ok) {
+      await this.request(`/${this.index}/_mapping`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          properties: {
+            fingerprint: { type: 'keyword' },
+            reinforcementCount: { type: 'integer' },
+          },
+        }),
+      });
       return;
+    }
+    if (exists.status !== 404) {
+      throw new Error(`Elasticsearch ${exists.status}: index check failed`);
     }
 
     await this.request(`/${this.index}`, {
@@ -145,6 +213,8 @@ export default class ElasticsearchMemoryStore {
             text: { type: 'text' },
             createdAt: { type: 'date' },
             updatedAt: { type: 'date' },
+            fingerprint: { type: 'keyword' },
+            reinforcementCount: { type: 'integer' },
           },
         },
       }),
@@ -152,18 +222,48 @@ export default class ElasticsearchMemoryStore {
   }
 
   private async request<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
-    const response = await fetch(`${this.url}${path}`, {
-      ...init,
-      headers: {
-        'content-type': 'application/json',
-        ...init.headers,
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`Elasticsearch ${response.status}: ${await response.text()}`);
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        const response = await fetch(`${this.url}${path}`, {
+          ...init,
+          headers: this.headers(init.headers),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (response.ok) {
+          return (await response.json()) as T;
+        }
+        const body = await response.text();
+        if (attempt === 2 || (response.status !== 429 && response.status < 500)) {
+          throw new Error(`Elasticsearch ${response.status}: ${body}`);
+        }
+      } catch (error) {
+        lastError = error;
+        if (attempt === 2) {
+          throw error;
+        }
+      }
     }
+    throw lastError instanceof Error ? lastError : new Error('Elasticsearch request failed');
+  }
 
-    return (await response.json()) as T;
+  private headers(extra?: HeadersInit): HeadersInit {
+    return {
+      'content-type': 'application/json',
+      ...(this.authorization ? { authorization: this.authorization } : {}),
+      ...extra,
+    };
+  }
+
+  private buildAuthorization(): string | undefined {
+    const apiKey = process.env.ELASTICSEARCH_API_KEY?.trim();
+    if (apiKey) {
+      return `ApiKey ${apiKey}`;
+    }
+    const username = process.env.ELASTICSEARCH_USERNAME?.trim();
+    const password = process.env.ELASTICSEARCH_PASSWORD;
+    return username && password
+      ? `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`
+      : undefined;
   }
 }

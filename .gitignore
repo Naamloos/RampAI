@@ -3,3 +3,5 @@ dist/
 node_modules/
 system-prompt.md
 chat-state.json
+
+system-prompt.md.history.json

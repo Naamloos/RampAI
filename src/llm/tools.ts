@@ -2,357 +2,162 @@ import type { Tool } from 'ollama';
 
 type ToolParameters = NonNullable<Tool['function']['parameters']>;
 
-function parameters(schema: Record<string, unknown>): ToolParameters {
-  return schema;
+function tool(
+  name: string,
+  description: string,
+  required: string[],
+  properties: Record<string, unknown>,
+): Tool {
+  return {
+    type: 'function',
+    function: {
+      name,
+      description,
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required,
+        properties,
+      } as ToolParameters,
+    },
+  };
 }
 
-export interface DiscordAction {
-  type: 'add_reaction' | 'change_nickname' | 'reply_to_message';
-  messageId?: string;
-  emoji?: string;
-  nickname?: string;
-  content?: string;
-}
+export type DiscordAction =
+  | { type: 'reply_to_message'; messageId: string; content: string }
+  | { type: 'add_reaction' | 'remove_reaction'; messageId: string; emoji: string }
+  | { type: 'edit_message'; messageId: string; content: string }
+  | { type: 'delete_message' | 'pin_message' | 'unpin_message'; messageId: string }
+  | { type: 'change_nickname'; nickname: string }
+  | { type: 'get_member_presence'; member: string }
+  | { type: 'create_poll'; question: string; answers: string[]; durationHours: number }
+  | { type: 'search_channel_history'; query: string; limit: number }
+  | { type: 'schedule_message'; content: string; delayMinutes: number };
 
 export interface AiResult {
   response?: string;
+  latestMessageId?: string;
 }
 
-export const aiResponseFormat = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['actions', 'response', 'no_response'],
-  properties: {
-    actions: {
-      type: 'array',
-      items: {
-        oneOf: [
-          {
-            type: 'object',
-            additionalProperties: false,
-            required: ['name', 'arguments'],
-            properties: {
-              name: { const: 'no_response' },
-              arguments: {
-                type: 'object',
-                additionalProperties: false,
-                properties: {},
-              },
-            },
-          },
-          {
-            type: 'object',
-            additionalProperties: false,
-            required: ['name', 'arguments'],
-            properties: {
-              name: { const: 'reply_to_message' },
-              arguments: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['message_id', 'content'],
-                properties: {
-                  message_id: { type: 'string', minLength: 1 },
-                  content: { type: 'string', minLength: 1 },
-                },
-              },
-            },
-          },
-          {
-            type: 'object',
-            additionalProperties: false,
-            required: ['name', 'arguments'],
-            properties: {
-              name: { const: 'add_reaction' },
-              arguments: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['message_id', 'emoji'],
-                properties: {
-                  message_id: { type: 'string', minLength: 1 },
-                  emoji: {
-                    type: 'string',
-                    pattern: '^(?:<a?:[A-Za-z0-9_]+:[0-9]+>|[^\\x00-\\x7F]+)$',
-                  },
-                },
-              },
-            },
-          },
-          {
-            type: 'object',
-            additionalProperties: false,
-            required: ['name', 'arguments'],
-            properties: {
-              name: { const: 'change_nickname' },
-              arguments: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['nickname'],
-                properties: {
-                  nickname: { type: 'string', minLength: 1 },
-                },
-              },
-            },
-          },
-          {
-            type: 'object',
-            additionalProperties: false,
-            required: ['name', 'arguments'],
-            properties: {
-              name: { const: 'update_system_prompt' },
-              arguments: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['markdown'],
-                properties: {
-                  markdown: { type: 'string', minLength: 1 },
-                },
-              },
-            },
-          },
-          {
-            type: 'object',
-            additionalProperties: false,
-            required: ['name', 'arguments'],
-            properties: {
-              name: { const: 'memory_search' },
-              arguments: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['query'],
-                properties: {
-                  query: { type: 'string', minLength: 1 },
-                  limit: { type: 'integer', minimum: 1, maximum: 10 },
-                },
-              },
-            },
-          },
-          {
-            type: 'object',
-            additionalProperties: false,
-            required: ['name', 'arguments'],
-            properties: {
-              name: { const: 'memory_store' },
-              arguments: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['text'],
-                properties: {
-                  text: { type: 'string', minLength: 1 },
-                },
-              },
-            },
-          },
-          {
-            type: 'object',
-            additionalProperties: false,
-            required: ['name', 'arguments'],
-            properties: {
-              name: { const: 'memory_update' },
-              arguments: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['id', 'text'],
-                properties: {
-                  id: { type: 'string', minLength: 1 },
-                  text: { type: 'string', minLength: 1 },
-                },
-              },
-            },
-          },
-          {
-            type: 'object',
-            additionalProperties: false,
-            required: ['name', 'arguments'],
-            properties: {
-              name: { const: 'memory_delete' },
-              arguments: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['id'],
-                properties: {
-                  id: { type: 'string', minLength: 1 },
-                },
-              },
-            },
-          },
-          {
-            type: 'object',
-            additionalProperties: false,
-            required: ['name', 'arguments'],
-            properties: {
-              name: { const: 'memory_recent' },
-              arguments: {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                  limit: { type: 'integer', minimum: 1, maximum: 20 },
-                },
-              },
-            },
-          },
-        ],
-      },
-    },
-    response: { type: 'string' },
-    no_response: { type: 'boolean' },
-  },
-} as const;
+const messageId = { type: 'string', minLength: 1 };
+const content = { type: 'string', minLength: 1 };
+const emoji = {
+  type: 'string',
+  description:
+    'Exact available custom emoji like <:name:id>, or a real Unicode emoji like 💀. Never use colon aliases or emoji names.',
+  pattern: '^(?:<a?:[A-Za-z0-9_]+:[0-9]+>|[^\\x00-\\x7F]+)$',
+};
 
 export const tools: Tool[] = [
-  {
-    type: 'function',
-    function: {
-      name: 'no_response',
-      description: 'Choose not to send a public Discord response for this turn.',
-      parameters: parameters({
-        type: 'object',
-        additionalProperties: false,
-        properties: {},
-      }),
+  tool('no_response', 'Send no public Discord response for this turn.', [], {}),
+  tool(
+    'reply_to_message',
+    'Reply directly to a message in this channel.',
+    ['message_id', 'content'],
+    {
+      message_id: messageId,
+      content,
     },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'reply_to_message',
-      description: 'Reply directly to a previous Discord message.',
-      parameters: parameters({
-        type: 'object',
-        additionalProperties: false,
-        required: ['message_id', 'content'],
-        properties: {
-          message_id: { type: 'string', minLength: 1 },
-          content: { type: 'string', minLength: 1 },
-        },
-      }),
+  ),
+  tool(
+    'add_reaction',
+    'Add one emoji reaction to a message in this channel.',
+    ['message_id', 'emoji'],
+    {
+      message_id: messageId,
+      emoji,
     },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'add_reaction',
-      description: 'Add one emoji reaction to a recent Discord message.',
-      parameters: parameters({
-        type: 'object',
-        additionalProperties: false,
-        required: ['message_id', 'emoji'],
-        properties: {
-          message_id: { type: 'string', minLength: 1 },
-          emoji: {
-            type: 'string',
-            description:
-              'Exact available custom emoji like <:name:id>, or a real Unicode emoji like 💀. Never use colon aliases like :skull: or plain names like skull.',
-            pattern: '^(?:<a?:[A-Za-z0-9_]+:[0-9]+>|[^\\x00-\\x7F]+)$',
-          },
-        },
-      }),
+  ),
+  tool(
+    'remove_reaction',
+    'Remove your own matching reaction from a message in this channel.',
+    ['message_id', 'emoji'],
+    { message_id: messageId, emoji },
+  ),
+  tool(
+    'edit_message',
+    'Edit one of your own messages in this channel.',
+    ['message_id', 'content'],
+    {
+      message_id: messageId,
+      content,
     },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'change_nickname',
-      description: 'Change your own Discord server nickname.',
-      parameters: parameters({
-        type: 'object',
-        additionalProperties: false,
-        required: ['nickname'],
-        properties: {
-          nickname: { type: 'string', minLength: 1 },
-        },
-      }),
+  ),
+  tool('delete_message', 'Delete one of your own messages in this channel.', ['message_id'], {
+    message_id: messageId,
+  }),
+  tool('pin_message', 'Pin a message in this channel.', ['message_id'], { message_id: messageId }),
+  tool('unpin_message', 'Unpin a message in this channel.', ['message_id'], {
+    message_id: messageId,
+  }),
+  tool('change_nickname', 'Change your own nickname in this Discord server.', ['nickname'], {
+    nickname: { type: 'string', minLength: 1, maxLength: 32 },
+  }),
+  tool(
+    'get_member_presence',
+    'Get a server member’s current Discord status and activities, including what they are playing. Accepts their ID, username, or nickname.',
+    ['member'],
+    { member: { type: 'string', minLength: 1, maxLength: 100 } },
+  ),
+  tool('create_poll', 'Create a poll in this channel.', ['question', 'answers'], {
+    question: { type: 'string', minLength: 1, maxLength: 300 },
+    answers: {
+      type: 'array',
+      minItems: 2,
+      maxItems: 10,
+      items: { type: 'string', minLength: 1, maxLength: 55 },
     },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'update_system_prompt',
-      description: 'Replace your persistent custom instructions markdown.',
-      parameters: parameters({
-        type: 'object',
-        additionalProperties: false,
-        required: ['markdown'],
-        properties: {
-          markdown: { type: 'string', minLength: 1 },
-        },
-      }),
+    duration_hours: { type: 'integer', minimum: 1, maximum: 168 },
+  }),
+  tool(
+    'search_channel_history',
+    'Search older messages in this channel when the supplied recent context is insufficient.',
+    ['query'],
+    {
+      query: { type: 'string', minLength: 1 },
+      limit: { type: 'integer', minimum: 1, maximum: 20 },
     },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'memory_search',
-      description:
-        'Search persistent memory before using, updating, or deduplicating remembered facts.',
-      parameters: parameters({
-        type: 'object',
-        additionalProperties: false,
-        required: ['query'],
-        properties: {
-          query: { type: 'string', minLength: 1 },
-          limit: { type: 'integer', minimum: 1, maximum: 10 },
-        },
-      }),
+  ),
+  tool(
+    'schedule_message',
+    'Schedule a message to be sent later in this channel. Use for reminders and delayed follow-ups.',
+    ['content', 'delay_minutes'],
+    {
+      content,
+      delay_minutes: { type: 'integer', minimum: 1, maximum: 43200 },
     },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'memory_store',
-      description: 'Store one concise, durable fact that should help future conversations.',
-      parameters: parameters({
-        type: 'object',
-        additionalProperties: false,
-        required: ['text'],
-        properties: {
-          text: { type: 'string', minLength: 1 },
-        },
-      }),
+  ),
+  tool(
+    'update_system_prompt',
+    'Replace your persistent personality instructions after reflection. Preserve established identity unless experience justifies a gradual change.',
+    ['markdown'],
+    { markdown: { type: 'string', minLength: 1, maxLength: 12000 } },
+  ),
+  tool(
+    'memory_search',
+    'Search persistent memory before using, updating, or deduplicating remembered facts.',
+    ['query'],
+    {
+      query: { type: 'string', minLength: 1 },
+      limit: { type: 'integer', minimum: 1, maximum: 10 },
     },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'memory_update',
-      description: 'Replace an existing memory with a corrected or more complete version.',
-      parameters: parameters({
-        type: 'object',
-        additionalProperties: false,
-        required: ['id', 'text'],
-        properties: {
-          id: { type: 'string', minLength: 1 },
-          text: { type: 'string', minLength: 1 },
-        },
-      }),
+  ),
+  tool('memory_store', 'Store one concise durable fact for future conversations.', ['text'], {
+    text: { type: 'string', minLength: 1, maxLength: 2000 },
+  }),
+  tool(
+    'memory_update',
+    'Replace an existing memory with a corrected or merged version.',
+    ['id', 'text'],
+    {
+      id: { type: 'string', minLength: 1 },
+      text: { type: 'string', minLength: 1, maxLength: 2000 },
     },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'memory_delete',
-      description: 'Delete an existing memory when it is wrong, private, or no longer wanted.',
-      parameters: parameters({
-        type: 'object',
-        additionalProperties: false,
-        required: ['id'],
-        properties: {
-          id: { type: 'string', minLength: 1 },
-        },
-      }),
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'memory_recent',
-      description: 'Inspect recently updated memories for self-audit or cleanup.',
-      parameters: parameters({
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          limit: { type: 'integer', minimum: 1, maximum: 20 },
-        },
-      }),
-    },
-  },
+  ),
+  tool('memory_delete', 'Delete a memory that is wrong, private, duplicated, or stale.', ['id'], {
+    id: { type: 'string', minLength: 1 },
+  }),
+  tool('memory_recent', 'Inspect recently updated memories during reflection or cleanup.', [], {
+    limit: { type: 'integer', minimum: 1, maximum: 20 },
+  }),
 ];
