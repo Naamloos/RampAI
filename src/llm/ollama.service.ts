@@ -6,20 +6,36 @@ import type { Message as OllamaMessage, ToolCall } from 'ollama';
 import ollama from 'ollama';
 import { buildSystemPrompt } from '../constants/system.js';
 import ElasticsearchMemoryStore from '../memory/elasticsearch-memory.store.js';
-import { tools } from './tools.js';
+import { compactToolArguments, compactToolResult, executeRegisteredTool, tools } from './tools.js';
 import type { AiResult, DiscordAction } from './tools.js';
+import {
+  boundedToolResult,
+  ContextBudgetError,
+  contextLimits,
+  fitContext,
+  isContextOverflow,
+} from './context-budget.js';
+import DiscordImageCache, { discordImageKey, IMAGE_BYTE_LIMIT } from '../discord/image-cache.js';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 const DEFAULT_SYSTEM_PROMPT = `# Custom Instructions
 No custom identity has been defined yet.
 `;
+const ATTACHMENT_TEXT_LIMIT = 2000;
+const ATTACHMENTS_PER_CONTEXT = 3;
+const ATTACHMENT_BYTE_LIMIT = 100_000;
+const ATTACHMENT_CACHE_LIMIT = 64;
+const ATTACHMENT_CACHE_TTL_MS = 10 * 60_000;
+const SEARCH_TIMEOUT_MS = 10_000;
 interface ChatStateEntry {
   action:
-  | 'run_start'
-  | 'processed_message'
-  | 'discord_message'
-  | 'respond'
-  | 'no_response'
-  | 'tool_call'
-  | 'tool_result';
+    | 'run_start'
+    | 'processed_message'
+    | 'discord_message'
+    | 'respond'
+    | 'no_response'
+    | 'tool_call'
+    | 'tool_result';
   at: string;
   trigger?: string;
   response?: string;
@@ -31,8 +47,14 @@ interface ChatStateEntry {
 export default class OllamaService {
   private static instance: OllamaService;
   private readonly memory = new ElasticsearchMemoryStore();
+  private readonly imageCache = new DiscordImageCache();
   private readonly pendingMessages: Message[] = [];
   private readonly recentDiscordActions = new Map<string, number>();
+  private readonly approvedProfileImageUrls = new Set<string>();
+  private readonly attachmentCache = new Map<
+    string,
+    { expiresAt: number; text: Promise<string> }
+  >();
   private readonly systemPromptPath = process.env.SYSTEM_PROMPT_PATH ?? 'system-prompt.md';
   private readonly chatStatePath = process.env.CHAT_STATE_PATH ?? 'chat-state.json';
   private chatStateCache?: ChatStateEntry[];
@@ -56,8 +78,12 @@ export default class OllamaService {
   public getIsThinking(): boolean {
     return this.isThinking;
   }
+  public hasPendingMessages(): boolean {
+    return this.pendingMessages.length > 0;
+  }
   public addIncomingMessage(message: Message): void {
     this.pendingMessages.push(message);
+    if (this.pendingMessages.length > 100) this.pendingMessages.shift();
     console.log(`Queued incoming message while thinking: ${message.id}`);
   }
   public async hasProcessedLatestMessage(messageId: string): Promise<boolean> {
@@ -108,11 +134,17 @@ export default class OllamaService {
     executeAction?: (action: DiscordAction) => Promise<unknown>,
     activity?: string,
     allowPublicResponse = true,
+    onToolResult?: (name: string, result: unknown, args: Record<string, unknown>) => Promise<void>,
   ): Promise<AiResult | undefined> {
     if (this.isThinking) {
       return undefined;
     }
     this.isThinking = true;
+    this.approvedProfileImageUrls.clear();
+    const known = new Set(chat.map((message) => message.id));
+    for (let index = this.pendingMessages.length - 1; index >= 0; index -= 1) {
+      if (known.has(this.pendingMessages[index]!.id)) this.pendingMessages.splice(index, 1);
+    }
     try {
       await this.appendChatState({
         action: 'run_start',
@@ -125,6 +157,7 @@ export default class OllamaService {
           latestMessageAuthorId: chat.at(-1)?.author.id,
         },
       });
+      const attachmentBudget = { remaining: ATTACHMENTS_PER_CONTEXT, imagesRemaining: 2 };
       const messages = await this.buildMessages(
         chat,
         emojis,
@@ -132,6 +165,7 @@ export default class OllamaService {
         trigger,
         activity,
         allowPublicResponse,
+        attachmentBudget,
       );
       const completedToolCalls = new Set<string>();
       let canRespond = allowPublicResponse;
@@ -141,7 +175,7 @@ export default class OllamaService {
         ? Math.min(20, Math.max(1, configuredToolSteps))
         : 8;
       for (let i = 0; i < maxToolSteps;) {
-        const pendingMessageId = await this.insertPendingMessages(messages);
+        const pendingMessageId = await this.insertPendingMessages(messages, attachmentBudget);
         if (pendingMessageId) {
           latestMessageId = pendingMessageId;
           canRespond = true;
@@ -152,6 +186,7 @@ export default class OllamaService {
           });
         }
         const response = await this.chatWithTimeout(messages);
+        i += 1;
         const rawContent = response.message.content;
         response.message.content = response.message.content.replace(
           /^\s*<(think(?:ing)?)>[\s\S]*?<\/\1>\s*/i,
@@ -164,7 +199,6 @@ export default class OllamaService {
           console.log('Discarding stale Ollama output because newer messages arrived');
           continue;
         }
-        i += 1;
         const toolCalls = response.message.tool_calls ?? [];
         if (toolCalls.length === 0) {
           const textToolCall = this.parseTextToolCall(response.message.content);
@@ -206,26 +240,37 @@ export default class OllamaService {
           const signature = JSON.stringify([toolCall.function.name, toolCall.function.arguments]);
           const toolResult = completedToolCalls.has(signature)
             ? {
-              stop: false,
-              result: {
-                tool: toolCall.function.name,
-                ok: false,
-                error: 'This exact tool call already completed. Do not repeat it.',
-              },
-            }
+                stop: false,
+                result: {
+                  tool: toolCall.function.name,
+                  ok: false,
+                  error: 'This exact tool call already completed. Do not repeat it.',
+                },
+              }
             : await this.handleLoggedToolCall(
-              toolCall,
-              trigger,
-              canRespond ? executeAction : undefined,
-            );
+                toolCall,
+                trigger,
+                canRespond ? executeAction : undefined,
+              );
           completedToolCalls.add(signature);
+          if (canRespond && onToolResult) {
+            try {
+              await onToolResult(
+                toolCall.function.name,
+                toolResult.result,
+                toolCall.function.arguments,
+              );
+            } catch (error) {
+              console.warn('Failed to publish tool summary:', error);
+            }
+          }
           if (toolResult.stop) {
             return latestMessageId ? { latestMessageId } : {};
           }
           messages.push({
             role: 'tool',
             tool_name: toolCall.function.name,
-            content: JSON.stringify(toolResult.result),
+            content: boundedToolResult(toolResult.result),
           });
         }
       }
@@ -236,6 +281,15 @@ export default class OllamaService {
         result: { reason: 'max_steps_reached' },
       });
       return latestMessageId ? { latestMessageId } : {};
+    } catch (error) {
+      if (!(error instanceof ContextBudgetError) && !isContextOverflow(error)) throw error;
+      console.warn('Context could not fit after compaction:', error);
+      return allowPublicResponse
+        ? {
+            response:
+              'I could not fit this request alongside my instructions. Shorten the input or increase OLLAMA_NUM_CTX; any tool actions already reported still took place.',
+          }
+        : {};
     } finally {
       this.isThinking = false;
     }
@@ -247,11 +301,31 @@ export default class OllamaService {
     trigger = 'message',
     activity?: string,
     allowPublicResponse = true,
+    attachmentBudget = { remaining: ATTACHMENTS_PER_CONTEXT, imagesRemaining: 2 },
   ): Promise<OllamaMessage[]> {
     const [systemPrompt, relevantMemories] = await Promise.all([
       this.readSystemPrompt(),
       this.findRelevantMemories(chat),
     ]);
+    const recentIds = new Set(
+      chat.slice(-20).flatMap((message) => [message.author.id, ...message.mentions.users.keys()]),
+    );
+    const latestText = chat
+      .slice(-5)
+      .map((message) => message.content.toLocaleLowerCase())
+      .join(' ');
+    const selectedMembers = [...(members ?? [])]
+      .sort((left, right) => {
+        const score = (member: GuildMember) =>
+          Number(recentIds.has(member.id)) * 2 +
+          Number(
+            [member.user.username, member.nickname].some(
+              (name) => name && latestText.includes(name.toLocaleLowerCase()),
+            ),
+          );
+        return score(right) - score(left);
+      })
+      .slice(0, 20);
     return [
       {
         role: 'system',
@@ -259,24 +333,25 @@ export default class OllamaService {
           systemPrompt,
           emojis
             ?.filter((emoji) => emoji.id)
-            .map(
-              (emoji) =>
-                `<${emoji.animated ? 'a' : ''}:${emoji.name ?? 'emoji'}:${emoji.id}>`,
-            )
+            .slice(0, 30)
+            .map((emoji) => `<${emoji.animated ? 'a' : ''}:${emoji.name ?? 'emoji'}:${emoji.id}>`)
             .join('\n'),
           JSON.stringify(
-            members?.map((member) => ({
+            selectedMembers.map((member) => ({
               username: member.user.username,
               nickname: member.nickname,
               id: member.id,
             })) ?? [],
           ),
           this.recentParticipants(chat),
-          `trigger=${trigger}; public_response_allowed=${allowPublicResponse}; clanker_trigger=${trigger !== 'reflection_tick' && this.hasClankerTrigger(chat)}${activity ? `; event=${activity}` : ''}`,
-          relevantMemories.map((memory) => `[${memory.id}] ${memory.text}`).join('\n'),
+          `trigger=${trigger}; public_response_allowed=${allowPublicResponse}; clanker_trigger=${trigger !== 'reflection_tick' && this.hasClankerTrigger(chat)}; catalogs are partial; get_member_presence can resolve uncatalogued names${activity ? `; event=${activity.slice(-2000)}` : ''}`,
+          relevantMemories
+            .map((memory) => `[${memory.id}] ${memory.text.slice(0, 500)}`)
+            .join('\n')
+            .slice(0, 3000),
         ),
       },
-      ...(await Promise.all(chat.map((message) => this.toOllamaMessageWithAttachments(message)))),
+      ...(await this.toOllamaMessagesWithAttachments(chat, attachmentBudget)),
     ];
   }
   private recentParticipants(chat: Message[]): string {
@@ -324,55 +399,165 @@ export default class OllamaService {
       return [];
     }
   }
-  private async insertPendingMessages(messages: OllamaMessage[]): Promise<string | undefined> {
+  private async insertPendingMessages(
+    messages: OllamaMessage[],
+    attachmentBudget = { remaining: ATTACHMENTS_PER_CONTEXT, imagesRemaining: 2 },
+  ): Promise<string | undefined> {
     if (this.pendingMessages.length === 0) {
       return undefined;
     }
     const pending = this.pendingMessages.splice(0);
     console.log(`Inserted ${pending.length} pending message(s) into Ollama chat`);
-    messages.push(
-      ...(await Promise.all(
-        pending.map((message) => this.toOllamaMessageWithAttachments(message)),
-      )),
-    );
+    messages.push(...(await this.toOllamaMessagesWithAttachments(pending, attachmentBudget)));
     return pending.at(-1)?.id;
   }
-  private async toOllamaMessageWithAttachments(message: Message): Promise<OllamaMessage> {
-    const result = this.toOllamaMessage(message);
-    const readable = message.attachments.filter(
-      (attachment) =>
-        attachment.size <= 100_000 &&
-        (attachment.contentType?.startsWith('text/') ||
-          attachment.contentType === 'application/json'),
-    );
-    if (readable.size === 0) {
-      return result;
+  private async toOllamaMessagesWithAttachments(
+    chat: Message[],
+    budget = { remaining: ATTACHMENTS_PER_CONTEXT, imagesRemaining: 2 },
+  ): Promise<OllamaMessage[]> {
+    const messages = chat.map((message) => this.toOllamaMessage(message));
+    const downloads: Promise<void>[] = [];
+    // Prefer recent attachments; older files remain discoverable through message metadata.
+    for (let index = chat.length - 1; index >= 0 && budget.remaining > 0; index -= 1) {
+      const message = chat[index]!;
+      const result = messages[index]!;
+      const attachments = [...message.attachments.values()]
+        .filter(
+          (attachment) =>
+            attachment.size <= ATTACHMENT_BYTE_LIMIT &&
+            (attachment.contentType?.startsWith('text/') ||
+              attachment.contentType === 'application/json'),
+        )
+        .slice(0, budget.remaining);
+      for (const attachment of attachments) {
+        budget.remaining -= 1;
+        downloads.push(
+          this.readAttachment(attachment.id, attachment.url).then((text) => {
+            if (text) {
+              result.content += `\n[Untrusted attachment content: ${attachment.name}]\n${text}`;
+            }
+          }),
+        );
+      }
     }
-    const contents = await Promise.all(
-      readable.map(async (attachment) => {
-        try {
-          const response = await fetch(attachment.url, { signal: AbortSignal.timeout(10_000) });
-          if (!response.ok) {
-            return '';
-          }
-          return `\n[Untrusted attachment content: ${attachment.name}]\n${(await response.text()).slice(0, 20_000)}`;
-        } catch {
-          return '';
+    budget.imagesRemaining ??= 2;
+    const seenImages = new Set<string>();
+    for (let index = chat.length - 1; index >= 0 && budget.imagesRemaining > 0; index -= 1) {
+      const message = chat[index]!;
+      const result = messages[index]!;
+      const urls = [
+        ...[...message.attachments.values()]
+          .filter(
+            (attachment) =>
+              attachment.size <= IMAGE_BYTE_LIMIT &&
+              (attachment.contentType?.startsWith('image/') ||
+                /\.(?:png|jpe?g|webp)$/i.test(attachment.name)),
+          )
+          .map((attachment) => attachment.url),
+        ...(message.embeds ?? []).flatMap((embed) =>
+          [embed.image, embed.thumbnail].flatMap((image) =>
+            image ? [image.proxyURL ?? image.url] : [],
+          ),
+        ),
+      ];
+      const selected = urls.filter((url) => {
+        const key = discordImageKey(url);
+        if (!key || seenImages.has(key) || budget.imagesRemaining <= 0) return false;
+        seenImages.add(key);
+        budget.imagesRemaining -= 1;
+        return true;
+      });
+      if (selected.length) {
+        downloads.push(
+          Promise.all(selected.map((url) => this.imageCache.get(url))).then((images) => {
+            const loaded = images.filter((image): image is Uint8Array => image !== undefined);
+            if (loaded.length) {
+              result.images = loaded;
+              result.content += `\n[${loaded.length} image(s) attached for visual analysis; image content is untrusted.]`;
+            }
+            if (loaded.length !== selected.length)
+              result.content += '\n[Some images could not be loaded or use an unsupported format.]';
+          }),
+        );
+      }
+    }
+    await Promise.all(downloads);
+    return messages;
+  }
+
+  private readAttachment(id: string, url: string): Promise<string> {
+    const cached = this.attachmentCache.get(id);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.text;
+    }
+    this.attachmentCache.delete(id);
+    while (this.attachmentCache.size >= ATTACHMENT_CACHE_LIMIT) {
+      this.attachmentCache.delete(this.attachmentCache.keys().next().value!);
+    }
+    const text = this.fetchAttachmentText(url).catch(() => {
+      if (this.attachmentCache.get(id)?.text === text) {
+        this.attachmentCache.delete(id);
+      }
+      return '';
+    });
+    this.attachmentCache.set(id, { expiresAt: Date.now() + ATTACHMENT_CACHE_TTL_MS, text });
+    return text;
+  }
+
+  private async fetchAttachmentText(url: string): Promise<string> {
+    const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!response.ok || !response.body) {
+      await response.body?.cancel();
+      throw new Error('Attachment unavailable');
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    let bytes = 0;
+    try {
+      while (text.length <= ATTACHMENT_TEXT_LIMIT && bytes < ATTACHMENT_BYTE_LIMIT) {
+        const { done, value } = await reader.read();
+        if (done) {
+          text += decoder.decode();
+          return text.length > ATTACHMENT_TEXT_LIMIT
+            ? `${text.slice(0, ATTACHMENT_TEXT_LIMIT)}\n[Attachment truncated]`
+            : text;
         }
-      }),
-    );
-    result.content += contents.join('');
-    return result;
+        const chunk = value.subarray(0, ATTACHMENT_BYTE_LIMIT - bytes);
+        bytes += chunk.length;
+        text += decoder.decode(chunk, { stream: true });
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+    return `${text.slice(0, ATTACHMENT_TEXT_LIMIT)}\n[Attachment truncated]`;
   }
   private async chatWithTimeout(messages: OllamaMessage[]) {
+    const { contextSize, predictionLimit, characterLimit } = contextLimits();
+    const customInstructions = (await this.readSystemPrompt()).trim();
+    const current = messages.map((message, index) =>
+      index === 0 && message.role === 'system'
+        ? {
+            ...message,
+            content: message.content.replace(
+              /(<custom_instructions>\n)[\s\S]*?(\n<\/custom_instructions>)/,
+              (_match, start: string, end: string) => `${start}${customInstructions}${end}`,
+            ),
+          }
+        : message,
+    );
+    const toolCharacters = Buffer.byteLength(JSON.stringify(tools));
+    let budget = characterLimit;
     const input = {
       model: process.env.OLLAMA_MODEL ?? 'gemma4:e4b',
-      messages,
+      messages: fitContext(current, budget, toolCharacters),
       tools,
       think: this.ollamaThink(),
-      keep_alive: process.env.OLLAMA_KEEP_ALIVE ?? '30m',
+      keep_alive: this.ollamaKeepAlive(),
       options: {
-        num_ctx: Number(process.env.OLLAMA_NUM_CTX ?? 8192),
+        num_ctx: contextSize,
+        num_predict: predictionLimit,
         embedding_only: false,
       },
     };
@@ -383,8 +568,11 @@ export default class OllamaService {
     const attempts = Number.isInteger(configuredAttempts)
       ? Math.min(3, Math.max(1, configuredAttempts))
       : 2;
-    console.log(`Ollama request: ${messages.length} messages, ${tools.length} tools`);
+    console.log(
+      `Ollama request: ${input.messages.length}/${messages.length} messages, ${tools.length} tools, ${budget} input budget, ${predictionLimit} output tokens`,
+    );
     let lastError: unknown;
+    let contextRetries = 0;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       let timeout: NodeJS.Timeout | undefined;
       try {
@@ -401,6 +589,14 @@ export default class OllamaService {
         return response;
       } catch (error) {
         lastError = error;
+        if (isContextOverflow(error) && contextRetries < 2) {
+          contextRetries += 1;
+          budget = Math.floor(budget * 0.75);
+          input.messages = fitContext(current, budget, toolCharacters);
+          console.warn(`Retrying context overflow with ${budget} input budget`);
+          attempt -= 1;
+          continue;
+        }
         console.warn(`Ollama attempt ${attempt}/${attempts} failed:`, error);
       } finally {
         if (timeout) {
@@ -431,6 +627,7 @@ export default class OllamaService {
       })),
       replyTo: message.reference?.messageId,
       attachments: message.attachments.map((attachment) => ({
+        id: attachment.id,
         name: attachment.name,
         contentType: attachment.contentType,
         size: attachment.size,
@@ -443,9 +640,9 @@ export default class OllamaService {
       })),
       poll: message.poll
         ? {
-          question: message.poll.question.text,
-          answers: message.poll.answers.map((answer) => answer.text),
-        }
+            question: message.poll.question.text,
+            answers: message.poll.answers.map((answer) => answer.text),
+          }
         : undefined,
       createdAt: message.createdAt.toISOString(),
     };
@@ -464,7 +661,7 @@ export default class OllamaService {
       ...(reactions ? [`reactions: ${reactions}`] : []),
       ...message.attachments.map(
         (attachment) =>
-          `attachment: ${attachment.name} (${attachment.contentType ?? 'unknown'}, ${attachment.size} bytes) ${attachment.url}`,
+          `attachment ${attachment.id}: ${attachment.name} (${attachment.contentType ?? 'unknown'}, ${attachment.size} bytes) ${attachment.url}`,
       ),
       ...message.embeds.map(
         (embed) =>
@@ -472,10 +669,10 @@ export default class OllamaService {
       ),
       ...(message.poll
         ? [
-          `poll: ${message.poll.question.text}; answers: ${message.poll.answers
-            .map((answer) => answer.text)
-            .join(', ')}`,
-        ]
+            `poll: ${message.poll.question.text}; answers: ${message.poll.answers
+              .map((answer) => answer.text)
+              .join(', ')}`,
+          ]
         : []),
     ].join(' | ');
     return {
@@ -517,6 +714,12 @@ export default class OllamaService {
     if (prompt.length < 20 || prompt.length > 12_000) {
       throw new Error('System prompt must be between 20 and 12000 characters.');
     }
+    // Reject an edit before persistence if it leaves no room for a subsequent request.
+    fitContext(
+      [{ role: 'system', content: buildSystemPrompt(prompt) }],
+      contextLimits().characterLimit - 1500,
+      Buffer.byteLength(JSON.stringify(tools)),
+    );
     const previous =
       this.systemPromptCache ?? (await readFile(this.systemPromptPath, 'utf8').catch(() => ''));
     await mkdir(dirname(this.systemPromptPath), { recursive: true });
@@ -538,9 +741,9 @@ export default class OllamaService {
       ) as unknown;
       return Array.isArray(value)
         ? value.filter(
-          (item): item is string =>
-            typeof item === 'string' && item.trim().length >= 20 && item.length <= 12_000,
-        )
+            (item): item is string =>
+              typeof item === 'string' && item.trim().length >= 20 && item.length <= 12_000,
+          )
         : [];
     } catch {
       return [];
@@ -578,46 +781,6 @@ export default class OllamaService {
     this.chatStateWrite = write;
     await write;
   }
-  private compactToolResult(result: unknown): unknown {
-    if (!result || typeof result !== 'object' || Array.isArray(result)) {
-      return result;
-    }
-    const value = result as Record<string, unknown>;
-    if (value.tool === 'memory_search' && Array.isArray(value.memories)) {
-      return {
-        tool: value.tool,
-        ok: value.ok,
-        count: value.memories.length,
-        ids: value.memories
-          .map((memory) =>
-            memory && typeof memory === 'object' && 'id' in memory
-              ? (memory as { id: unknown }).id
-              : undefined,
-          )
-          .filter(Boolean),
-      };
-    }
-    if (value.tool === 'memory_recent' && Array.isArray(value.memories)) {
-      return {
-        tool: value.tool,
-        ok: value.ok,
-        count: value.memories.length,
-      };
-    }
-    return result;
-  }
-  private compactToolArguments(
-    name: string,
-    args: Record<string, unknown>,
-  ): Record<string, unknown> {
-    if (name === 'update_system_prompt') {
-      return { markdownLength: typeof args.markdown === 'string' ? args.markdown.length : 0 };
-    }
-    if (name.startsWith('memory_') && typeof args.text === 'string') {
-      return { ...args, text: `${args.text.slice(0, 200)}${args.text.length > 200 ? '…' : ''}` };
-    }
-    return args;
-  }
   private async handleToolCall(
     call: ToolCall,
     executeAction?: (action: DiscordAction) => Promise<unknown>,
@@ -634,7 +797,7 @@ export default class OllamaService {
       at: new Date().toISOString(),
       trigger,
       tool: call.function.name,
-      arguments: this.compactToolArguments(call.function.name, call.function.arguments),
+      arguments: compactToolArguments(call.function.name, call.function.arguments),
     });
     const toolResult = await this.handleToolCall(call, executeAction);
     await this.appendChatState({
@@ -642,7 +805,7 @@ export default class OllamaService {
       at: new Date().toISOString(),
       trigger,
       tool: call.function.name,
-      result: this.compactToolResult(toolResult.result),
+      result: compactToolResult(call.function.name, toolResult.result),
     });
     return toolResult;
   }
@@ -651,215 +814,49 @@ export default class OllamaService {
     args: Record<string, unknown>,
     executeAction?: (action: DiscordAction) => Promise<unknown>,
   ): Promise<{ stop: boolean; result: unknown }> {
-    console.log(`Tool call: ${name}`);
+    console.log(`Tool call: ${name}`, compactToolArguments(name, args));
     try {
-      switch (name) {
-        case 'reply_to_message':
-        case 'edit_message':
-          if (this.hasExactArgs(args, ['message_id', 'content'])) {
-            const messageId = this.stringArg(args, 'message_id');
-            const content = this.stringArg(args, 'content');
-            if (!messageId || !content) {
-              break;
-            }
-            return await this.runDiscordAction(executeAction, { type: name, messageId, content });
-          }
-          break;
-        case 'add_reaction':
-        case 'remove_reaction':
-          if (this.hasExactArgs(args, ['message_id', 'emoji'])) {
-            const messageId = this.stringArg(args, 'message_id');
-            const emoji = this.stringArg(args, 'emoji');
-            if (!messageId || !emoji) {
-              break;
-            }
-            return await this.runDiscordAction(executeAction, { type: name, messageId, emoji });
-          }
-          break;
-        case 'delete_message':
-        case 'pin_message':
-        case 'unpin_message':
-          if (this.hasExactArgs(args, ['message_id'])) {
-            const messageId = this.stringArg(args, 'message_id');
-            if (!messageId) {
-              break;
-            }
-            return await this.runDiscordAction(executeAction, { type: name, messageId });
-          }
-          break;
-        case 'change_nickname':
-          if (this.hasExactArgs(args, ['nickname'])) {
-            const nickname = this.stringArg(args, 'nickname');
-            if (!nickname || nickname.length > 32) {
-              break;
-            }
-            return await this.runDiscordAction(executeAction, { type: name, nickname });
-          }
-          break;
-        case 'get_member_presence':
-          if (this.hasExactArgs(args, ['member'])) {
-            const member = this.stringArg(args, 'member');
-            if (!member || member.length > 100) {
-              break;
-            }
-            return await this.runDiscordAction(executeAction, { type: name, member });
-          }
-          break;
-        case 'create_poll':
-          if (this.hasExactArgs(args, ['question', 'answers'], ['duration_hours'])) {
-            const question = this.stringArg(args, 'question');
-            const answers = Array.isArray(args.answers)
-              ? args.answers.filter(
-                (answer): answer is string => typeof answer === 'string' && !!answer.trim(),
-              )
-              : [];
-            const durationHours = this.integerArg(args, 'duration_hours', 1, 168, 24);
-            if (
-              !question ||
-              question.length > 300 ||
-              !Number.isFinite(durationHours) ||
-              answers.length < 2 ||
-              answers.length > 10 ||
-              answers.some((answer) => answer.length > 55)
-            ) {
-              break;
-            }
-            return await this.runDiscordAction(executeAction, {
-              type: 'create_poll',
-              question,
-              answers,
-              durationHours,
-            });
-          }
-          break;
-        case 'search_channel_history':
-          if (this.hasExactArgs(args, ['query'], ['limit'])) {
-            const query = this.stringArg(args, 'query');
-            if (!query) {
-              break;
-            }
-            return await this.runDiscordAction(executeAction, {
-              type: 'search_channel_history',
-              query,
-              limit: this.integerArg(args, 'limit', 1, 20, 10),
-            });
-          }
-          break;
-        case 'schedule_message':
-          if (this.hasExactArgs(args, ['content', 'delay_minutes'])) {
-            const content = this.stringArg(args, 'content');
-            const delayMinutes = this.integerArg(args, 'delay_minutes', 1, 43200);
-            if (!content || !Number.isFinite(delayMinutes)) {
-              break;
-            }
-            return await this.runDiscordAction(executeAction, {
-              type: 'schedule_message',
-              content,
-              delayMinutes,
-            });
-          }
-          break;
-        case 'update_system_prompt':
-          if (this.hasExactArgs(args, ['markdown'])) {
-            const markdown = this.stringArg(args, 'markdown');
-            if (!markdown) {
-              break;
-            }
-            await this.writeSystemPrompt(markdown);
-            console.log(`Updated system prompt at ${this.systemPromptPath}`);
-            return {
-              stop: false,
-              result: { tool: 'update_system_prompt', ok: true, path: this.systemPromptPath },
-            };
-          }
-          break;
-        case 'memory_search':
-          if (this.hasExactArgs(args, ['query'], ['limit'])) {
-            const query = this.stringArg(args, 'query');
-            const limit = this.integerArg(args, 'limit', 1, 10, 5);
-            if (!query || query.length > 800 || !Number.isFinite(limit)) {
-              break;
-            }
-            return {
-              stop: false,
-              result: {
-                tool: 'memory_search',
-                ok: true,
-                memories: await this.memory.search(query, limit),
-              },
-            };
-          }
-          break;
-        case 'memory_store':
-          if (this.hasExactArgs(args, ['text'])) {
-            const text = this.stringArg(args, 'text');
-            if (!text || text.length > 2000) {
-              break;
-            }
-            return {
-              stop: false,
-              result: { tool: 'memory_store', ok: true, id: await this.memory.store(text) },
-            };
-          }
-          break;
-        case 'memory_update':
-          if (this.hasExactArgs(args, ['id', 'text'])) {
-            const id = this.stringArg(args, 'id');
-            const text = this.stringArg(args, 'text');
-            if (!id || !text || text.length > 2000) {
-              break;
-            }
-            return {
-              stop: false,
-              result: {
-                tool: 'memory_update',
-                ok: true,
-                id: await this.memory.update(id, text),
-              },
-            };
-          }
-          break;
-        case 'memory_delete':
-          if (this.hasExactArgs(args, ['id'])) {
-            const id = this.stringArg(args, 'id');
-            if (!id) {
-              break;
-            }
-            return {
-              stop: false,
-              result: { tool: 'memory_delete', ok: true, id: await this.memory.delete(id) },
-            };
-          }
-          break;
-        case 'memory_recent':
-          if (this.hasExactArgs(args, [], ['limit'])) {
-            const limit = this.integerArg(args, 'limit', 1, 20, 10);
-            if (!Number.isFinite(limit)) {
-              break;
-            }
-            return {
-              stop: false,
-              result: {
-                tool: 'memory_recent',
-                ok: true,
-                memories: await this.memory.recent(limit),
-              },
-            };
-          }
-          break;
-        case 'no_response':
-          console.log('Tool result: no_response ok');
-          return { stop: true, result: { tool: 'no_response', ok: true } };
-      }
-      console.warn(`Tool result: ${name} invalid args`, args);
-      return {
-        stop: false,
-        result: {
-          tool: name,
-          ok: false,
-          error: 'Invalid tool arguments. Use the exact schema for this tool and no extra keys.',
+      return await executeRegisteredTool(name, args, {
+        discord: async (action) => await this.runDiscordAction(executeAction, action),
+        updateSystemPrompt: async (markdown) => {
+          await this.writeSystemPrompt(markdown);
+          console.log(`Updated system prompt at ${this.systemPromptPath}`);
+          return {
+            stop: false,
+            result: { tool: 'update_system_prompt', ok: true, path: this.systemPromptPath },
+          };
         },
-      };
+        searchWeb: async (query, limit, category) => await this.searchWeb(query, limit, category),
+        searchWikipedia: async (query, limit) => await this.searchWikipedia(query, limit),
+        searchWikidata: async (query, limit, language) =>
+          await this.searchWikidata(query, limit, language),
+        readWebPage: async (url, maxCharacters) => await this.readWebPage(url, maxCharacters),
+        changeProfilePicture: async ({ imageUrl, messageId, attachmentId }) => {
+          if (imageUrl && !this.approvedProfileImageUrls.has(imageUrl)) {
+            return {
+              stop: false,
+              result: {
+                tool: 'change_profile_picture',
+                ok: false,
+                error: 'image_url must come from a search result in this turn.',
+              },
+            };
+          }
+          return await this.runDiscordAction(executeAction, {
+            type: 'change_profile_picture',
+            ...(imageUrl ? { imageUrl } : {}),
+            ...(messageId ? { messageId } : {}),
+            ...(attachmentId ? { attachmentId } : {}),
+          });
+        },
+        memory: {
+          search: async (query, limit) => await this.memory.search(query, limit),
+          store: async (text) => await this.memory.store(text),
+          update: async (id, text) => await this.memory.update(id, text),
+          delete: async (id) => await this.memory.delete(id),
+          recent: async (limit) => await this.memory.recent(limit),
+        },
+      });
     } catch (error) {
       console.error(`Tool result: ${name} failed`, error);
       return {
@@ -872,29 +869,272 @@ export default class OllamaService {
       };
     }
   }
-  private hasExactArgs(args: Record<string, unknown>, required: string[], optional: string[] = []) {
-    const allowed = new Set([...required, ...optional]);
-    const keys = Object.keys(args);
-    return keys.every((key) => allowed.has(key)) && required.every((key) => key in args);
+  private async searchWeb(query: string, limit: number, category: 'general' | 'images') {
+    const baseUrl = process.env.WEB_SEARCH_BASE_URL?.trim() || 'https://www.bing.com';
+    const url = new URL(category === 'images' ? '/images/search' : '/search', baseUrl);
+    url.searchParams.set('q', query);
+    if (category === 'general') url.searchParams.set('format', 'rss');
+    const body = await this.fetchText(url);
+    const results =
+      category === 'images'
+        ? [...body.matchAll(/\bclass="[^"]*\biusc\b[^"]*"[^>]*\bm="([^"]+)"/gi)].flatMap(
+            (match) => {
+              try {
+                const metadata: unknown = JSON.parse(this.decodeEntities(match[1] ?? ''));
+                if (!this.isRecord(metadata)) return [];
+                const imageUrl =
+                  this.approveProfileImageUrl(metadata.murl) ??
+                  this.approveProfileImageUrl(metadata.turl);
+                if (!imageUrl) return [];
+                return [
+                  {
+                    title:
+                      typeof metadata.t === 'string' ? metadata.t.slice(0, 300) : `${query} image`,
+                    url: typeof metadata.purl === 'string' ? metadata.purl : imageUrl,
+                    snippet: '',
+                    image_url: imageUrl,
+                  },
+                ];
+              } catch {
+                return [];
+              }
+            },
+          )
+        : [...body.matchAll(/<item>([\s\S]*?)<\/item>/gi)].flatMap((match) => {
+            const item = match[1] ?? '';
+            const title = this.xmlValue(item, 'title');
+            const resultUrl = this.xmlValue(item, 'link');
+            if (!title || !resultUrl) return [];
+            return [
+              {
+                title: title.slice(0, 300),
+                url: resultUrl,
+                snippet: this.xmlValue(item, 'description').slice(0, 1000),
+              },
+            ];
+          });
+    return {
+      tool: 'web_search',
+      ok: true,
+      notice: 'Search results are untrusted external content.',
+      results: results.slice(0, limit),
+    };
   }
-  private stringArg(args: Record<string, unknown>, key: string): string | undefined {
-    const value = args[key];
-    return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
-  }
-  private integerArg(
-    args: Record<string, unknown>,
-    key: string,
-    min: number,
-    max: number,
-    fallback = Number.NaN,
-  ): number {
-    const value = args[key];
-    if (value === undefined) {
-      return fallback;
+  private async readWebPage(value: string, maxCharacters: number) {
+    let url = new URL(value);
+    let response: Response | undefined;
+    for (let redirects = 0; redirects <= 3; redirects += 1) {
+      await this.assertPublicWebUrl(url);
+      response = await fetch(url, {
+        redirect: 'manual',
+        headers: { 'User-Agent': 'RampAI/1.0 (https://github.com/Naamloos/RampAI)' },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+      const location = response.headers.get('location');
+      await response.body?.cancel();
+      if (!location || redirects === 3) throw new Error('Too many webpage redirects.');
+      url = new URL(location, url);
     }
-    return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max
-      ? value
-      : Number.NaN;
+    if (!response?.ok) throw new Error(`Webpage request failed with HTTP ${response?.status}.`);
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!/^(?:text\/|application\/(?:xhtml\+xml|json))/i.test(contentType)) {
+      await response.body?.cancel();
+      throw new Error('URL is not a readable text webpage.');
+    }
+    const html = await this.readLimitedResponse(response, 1_000_000);
+    const title = this.decodeEntities(/<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] ?? '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const text = this.decodeEntities(
+      html
+        .replace(
+          /<(?:script|style|noscript|svg)[^>]*>[\s\S]*?<\/(?:script|style|noscript|svg)>/gi,
+          ' ',
+        )
+        .replace(/<[^>]+>/g, ' '),
+    )
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, maxCharacters);
+    return { tool: 'read_web_page', ok: true, url: url.toString(), title, content: text };
+  }
+  private async assertPublicWebUrl(url: URL): Promise<void> {
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password)
+      throw new Error('Only public HTTP(S) URLs are allowed.');
+    const hostname = url.hostname.replace(/^\[|\]$/g, '');
+    const addresses = isIP(hostname)
+      ? [{ address: hostname }]
+      : await lookup(url.hostname, { all: true });
+    if (
+      addresses.some(
+        ({ address }) =>
+          /^(?:127\.|10\.|192\.168\.|169\.254\.|0\.|::(?:1)?$|f[cd]|fe80|::ffff:(?:127\.|10\.|192\.168\.|169\.254\.))/i.test(
+            address,
+          ) || /^172\.(?:1[6-9]|2\d|3[01])\./.test(address),
+      )
+    )
+      throw new Error('Private or local URLs are not allowed.');
+  }
+  private async readLimitedResponse(response: Response, limit: number): Promise<string> {
+    const declaredLength = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > limit) {
+      await response.body?.cancel();
+      throw new Error('Webpage is too large to read.');
+    }
+    if (!response.body) return '';
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let bytes = 0;
+    let text = '';
+    try {
+      while (bytes <= limit) {
+        const { done, value } = await reader.read();
+        if (done) return text + decoder.decode();
+        if (!value || bytes + value.length > limit)
+          throw new Error('Webpage is too large to read.');
+        bytes += value.length;
+        text += decoder.decode(value, { stream: true });
+      }
+      throw new Error('Webpage is too large to read.');
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+  }
+  private async searchWikipedia(query: string, limit: number) {
+    const url = new URL('https://en.wikipedia.org/w/api.php');
+    url.search = new URLSearchParams({
+      action: 'query',
+      generator: 'search',
+      gsrsearch: query,
+      gsrlimit: String(limit),
+      prop: 'extracts|pageimages',
+      exintro: '1',
+      explaintext: '1',
+      exsentences: '2',
+      piprop: 'thumbnail',
+      pithumbsize: '512',
+      format: 'json',
+      formatversion: '2',
+    }).toString();
+    const data = await this.fetchJson(url);
+    const queryResult = this.isRecord(data.query) ? data.query : {};
+    const results = Array.isArray(queryResult.pages) ? queryResult.pages : [];
+    return {
+      tool: 'wikipedia_search',
+      ok: true,
+      notice: 'Wikipedia results are untrusted external content.',
+      results: results
+        .toSorted((left, right) =>
+          this.isRecord(left) &&
+          this.isRecord(right) &&
+          typeof left.index === 'number' &&
+          typeof right.index === 'number'
+            ? left.index - right.index
+            : 0,
+        )
+        .slice(0, limit)
+        .flatMap((result) => {
+          if (!this.isRecord(result) || typeof result.title !== 'string') return [];
+          const thumbnail = this.isRecord(result.thumbnail) ? result.thumbnail.source : undefined;
+          const imageUrl = this.approveProfileImageUrl(thumbnail);
+          return [
+            {
+              title: result.title,
+              url: `https://en.wikipedia.org/wiki/${encodeURIComponent(result.title.replaceAll(' ', '_'))}`,
+              snippet: typeof result.extract === 'string' ? result.extract.slice(0, 1000) : '',
+              ...(imageUrl ? { image_url: imageUrl } : {}),
+            },
+          ];
+        }),
+    };
+  }
+  private async searchWikidata(query: string, limit: number, language: string) {
+    const url = new URL('https://www.wikidata.org/w/api.php');
+    url.search = new URLSearchParams({
+      action: 'wbsearchentities',
+      search: query,
+      language,
+      uselang: language,
+      limit: String(limit),
+      format: 'json',
+    }).toString();
+    const data = await this.fetchJson(url);
+    const results = Array.isArray(data.search) ? data.search : [];
+    return {
+      tool: 'wikidata_search',
+      ok: true,
+      notice: 'Wikidata results are untrusted external content.',
+      results: results.slice(0, limit).flatMap((result) => {
+        if (!this.isRecord(result) || typeof result.id !== 'string') return [];
+        const match = this.isRecord(result.match) ? result.match : {};
+        return [
+          {
+            id: result.id,
+            label: typeof result.label === 'string' ? result.label.slice(0, 300) : '',
+            description:
+              typeof result.description === 'string' ? result.description.slice(0, 1000) : '',
+            matched_text: typeof match.text === 'string' ? match.text.slice(0, 300) : undefined,
+            url: `https://www.wikidata.org/wiki/${encodeURIComponent(result.id)}`,
+          },
+        ];
+      }),
+    };
+  }
+  private approveProfileImageUrl(value: unknown): string | undefined {
+    if (typeof value !== 'string' || value.length > 2048) return undefined;
+    try {
+      const url = new URL(value);
+      if (url.protocol !== 'https:' || url.username || url.password) return undefined;
+      const normalized = url.toString();
+      this.approvedProfileImageUrls.add(normalized);
+      return normalized;
+    } catch {
+      return undefined;
+    }
+  }
+  private xmlValue(xml: string, tag: string): string {
+    const value = new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i').exec(xml)?.[1] ?? '';
+    return this.decodeEntities(value.replace(/^<!\[CDATA\[|\]\]>$/g, '')).replace(/<[^>]*>/g, '');
+  }
+  private decodeEntities(value: string): string {
+    return value
+      .replace(/&#x([0-9a-f]+);/gi, (_match, code: string) =>
+        String.fromCodePoint(Number.parseInt(code, 16)),
+      )
+      .replace(/&#(\d+);/g, (_match, code: string) =>
+        String.fromCodePoint(Number.parseInt(code, 10)),
+      )
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&');
+  }
+  private async fetchText(url: URL): Promise<string> {
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'RampAI/1.0 (https://github.com/Naamloos/RampAI)' },
+      signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      throw new Error(`Search request failed with HTTP ${response.status}.`);
+    }
+    return await response.text();
+  }
+  private async fetchJson(url: URL): Promise<Record<string, unknown>> {
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'RampAI/1.0 (https://github.com/Naamloos/RampAI)' },
+      signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      throw new Error(`Search request failed with HTTP ${response.status}.`);
+    }
+    const data: unknown = await response.json();
+    if (!this.isRecord(data)) {
+      throw new Error('Search returned an invalid response.');
+    }
+    return data;
   }
   private async runDiscordAction(
     executeAction: ((action: DiscordAction) => Promise<unknown>) | undefined,
@@ -911,8 +1151,16 @@ export default class OllamaService {
       };
     }
     const signature = JSON.stringify(action);
-    const shouldCooldown =
-      action.type !== 'search_channel_history' && action.type !== 'get_member_presence';
+    const shouldCooldown = ![
+      'read_attachment',
+      'list_reaction_users',
+      'search_channel_history',
+      'get_member_presence',
+      'get_message',
+      'get_poll_results',
+      'list_pinned_messages',
+      'list_scheduled_messages',
+    ].includes(action.type);
     const configuredCooldown = Number(process.env.ACTION_COOLDOWN_MS ?? 10000);
     const cooldown = Number.isFinite(configuredCooldown) ? Math.max(0, configuredCooldown) : 10_000;
     const previous = this.recentDiscordActions.get(signature);
@@ -988,5 +1236,9 @@ export default class OllamaService {
       return false;
     }
     return value === 'low' || value === 'medium' || value === 'high' ? value : 'low';
+  }
+  private ollamaKeepAlive(): string | number {
+    const value = process.env.OLLAMA_KEEP_ALIVE?.trim() || '30m';
+    return /^-?\d+$/.test(value) ? Number(value) : value;
   }
 }

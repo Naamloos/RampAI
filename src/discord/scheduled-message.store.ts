@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 export interface ScheduledMessage {
@@ -12,6 +12,24 @@ export interface ScheduledMessage {
 export default class ScheduledMessageStore {
   private readonly path = process.env.SCHEDULED_MESSAGES_PATH ?? 'scheduled-messages.json';
   private lock = Promise.resolve();
+
+  async list(): Promise<ScheduledMessage[]> {
+    return await this.exclusive(async () =>
+      (await this.read()).sort((left, right) => Date.parse(left.dueAt) - Date.parse(right.dueAt)),
+    );
+  }
+
+  async cancel(id: string): Promise<boolean> {
+    return await this.exclusive(async () => {
+      const entries = await this.read();
+      const remaining = entries.filter((entry) => entry.id !== id);
+      if (remaining.length === entries.length) {
+        return false;
+      }
+      await this.write(remaining);
+      return true;
+    });
+  }
 
   async schedule(content: string, delayMinutes: number): Promise<ScheduledMessage> {
     return await this.exclusive(async () => {
@@ -45,6 +63,34 @@ export default class ScheduledMessageStore {
     });
   }
 
+  async deliverDue(send: (entry: ScheduledMessage) => Promise<string | undefined>): Promise<void> {
+    await this.exclusive(async () => {
+      let entries = await this.read();
+      const errors: unknown[] = [];
+      for (const due of entries.filter((entry) => Date.parse(entry.dueAt) <= Date.now())) {
+        let entry = due;
+        try {
+          while (true) {
+            const remaining = await send(entry);
+            entries = remaining
+              ? entries.map((item) =>
+                  item.id === entry.id ? { ...item, content: remaining } : item,
+                )
+              : entries.filter((item) => item.id !== entry.id);
+            await this.write(entries);
+            if (!remaining) break;
+            entry = { ...entry, content: remaining };
+          }
+        } catch (error) {
+          // Leave failed and unsent content on disk; continue with other due reminders.
+          errors.push(error);
+          entries = await this.read();
+        }
+      }
+      if (errors.length) throw new AggregateError(errors, 'Some reminders could not be delivered.');
+    });
+  }
+
   private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
     const previous = this.lock;
     let release = () => {};
@@ -62,20 +108,25 @@ export default class ScheduledMessageStore {
   private async read(): Promise<ScheduledMessage[]> {
     try {
       const value = JSON.parse(await readFile(this.path, 'utf8')) as unknown;
-      return Array.isArray(value)
-        ? value.filter((entry): entry is ScheduledMessage => this.isEntry(entry))
-        : [];
-    } catch (error) {
-      if (error instanceof Error && 'code' in error && error.code !== 'ENOENT') {
-        console.warn(`Failed to read scheduled messages from ${this.path}:`, error.message);
+      if (!Array.isArray(value) || !value.every((entry) => this.isEntry(entry))) {
+        throw new Error('Invalid scheduled-message file; refusing to overwrite it.');
       }
-      return [];
+      return value;
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+      throw error;
     }
   }
 
   private async write(entries: ScheduledMessage[]): Promise<void> {
     await mkdir(dirname(this.path), { recursive: true });
-    await writeFile(this.path, `${JSON.stringify(entries, null, 2)}\n`, 'utf8');
+    const temporary = `${this.path}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, `${JSON.stringify(entries, null, 2)}\n`, 'utf8');
+      await rename(temporary, this.path);
+    } finally {
+      await unlink(temporary).catch(() => {});
+    }
   }
 
   private isEntry(value: unknown): value is ScheduledMessage {

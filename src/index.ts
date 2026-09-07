@@ -1,6 +1,15 @@
 import consoleStamp from 'console-stamp';
 import chalk from 'chalk';
-import { Client, Events, GatewayIntentBits, Partials, TextChannel } from 'discord.js';
+import {
+  Client,
+  ContainerBuilder,
+  Events,
+  GatewayIntentBits,
+  MessageFlags,
+  Partials,
+  TextChannel,
+  TextDisplayBuilder,
+} from 'discord.js';
 import MessageCreateEvent from './events/message-create.event.js';
 
 consoleStamp.default(console, {
@@ -92,6 +101,15 @@ async function initialize(): Promise<void> {
   if (!(channel instanceof TextChannel)) {
     throw new Error('DISCORD_CHANNEL_ID must identify a guild text channel visible to the bot.');
   }
+  await channel.send({
+    flags: MessageFlags.IsComponentsV2 | MessageFlags.SuppressNotifications,
+    components: [
+      new ContainerBuilder()
+        .setAccentColor(0x5865f2)
+        .addTextDisplayComponents(new TextDisplayBuilder().setContent('🟢 Bot online')),
+    ],
+    allowedMentions: { parse: [] },
+  });
   await channel.guild.members
     .fetch({ withPresences: true })
     .catch((error) => console.warn('Failed to refresh guild members; using cache:', error));

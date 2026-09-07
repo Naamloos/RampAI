@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 interface SearchHit {
   _id: string;
@@ -26,7 +26,8 @@ export default class ElasticsearchMemoryStore {
     '',
   );
   private readonly authorization = this.buildAuthorization();
-  private indexReady?: Promise<void>;
+  private indexReady?: Promise<void> | undefined;
+  private mutation: Promise<unknown> = Promise.resolve();
 
   async search(query: string, limit = 5): Promise<MemorySearchResult[]> {
     await this.ensureIndex();
@@ -87,6 +88,16 @@ export default class ElasticsearchMemoryStore {
   }
 
   async store(text: string): Promise<string> {
+    return await this.exclusive(() => this.storeMemory(text));
+  }
+
+  private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const pending = this.mutation.then(operation);
+    this.mutation = pending.catch(() => {});
+    return await pending;
+  }
+
+  private async storeMemory(text: string): Promise<string> {
     await this.ensureIndex();
 
     const now = new Date().toISOString();
@@ -102,38 +113,59 @@ export default class ElasticsearchMemoryStore {
     );
     const existing = duplicate.hits?.hits?.[0];
     if (existing) {
-      await this.request(`/${this.index}/_update/${encodeURIComponent(existing._id)}`, {
-        method: 'POST',
-        body: JSON.stringify({
-          script: {
-            source:
-              'ctx._source.reinforcementCount = (ctx._source.reinforcementCount ?: 1) + 1; ctx._source.updatedAt = params.now',
-            params: { now },
-          },
-        }),
-      });
+      await this.request(
+        `/${this.index}/_update/${encodeURIComponent(existing._id)}?refresh=true`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            script: {
+              source:
+                'ctx._source.reinforcementCount = (ctx._source.reinforcementCount ?: 1) + 1; ctx._source.updatedAt = params.now',
+              params: { now },
+            },
+          }),
+        },
+      );
       return existing._id;
     }
 
-    const response = await this.request<{ _id: string }>(`/${this.index}/_doc`, {
-      method: 'POST',
-      body: JSON.stringify({
-        text,
-        createdAt: now,
-        updatedAt: now,
-        fingerprint,
-        reinforcementCount: 1,
-      }),
-    });
-
-    return response._id;
+    const configured = Number(process.env.MEMORY_LIMIT ?? 5000);
+    const limit = Number.isInteger(configured) && configured > 0 ? configured : 5000;
+    const { count } = await this.request<{ count: number }>(`/${this.index}/_count`);
+    if (!Number.isInteger(count) || count < 0) throw new Error('Unable to verify memory capacity.');
+    if (count >= limit) {
+      throw new Error(
+        `Memory capacity reached (${limit}). Existing memories were preserved. Correct or consolidate existing facts before storing more.`,
+      );
+    }
+    // A stable ID for this request prevents retries from creating a second document.
+    const id = randomUUID();
+    try {
+      await this.request(`/${this.index}/_create/${id}?refresh=true`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          text,
+          createdAt: now,
+          updatedAt: now,
+          fingerprint,
+          reinforcementCount: 1,
+        }),
+      });
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith('Elasticsearch 409:')) throw error;
+    }
+    return id;
   }
 
   async update(id: string, text: string): Promise<string> {
+    return await this.exclusive(() => this.updateMemory(id, text));
+  }
+
+  private async updateMemory(id: string, text: string): Promise<string> {
     await this.ensureIndex();
 
     try {
-      await this.request(`/${this.index}/_update/${encodeURIComponent(id)}`, {
+      await this.request(`/${this.index}/_update/${encodeURIComponent(id)}?refresh=true`, {
         method: 'POST',
         body: JSON.stringify({
           doc: {
@@ -147,7 +179,7 @@ export default class ElasticsearchMemoryStore {
       });
     } catch (error) {
       if (error instanceof Error && error.message.includes('document_missing_exception')) {
-        return await this.store(text);
+        return await this.storeMemory(text);
       }
 
       throw error;
@@ -157,10 +189,14 @@ export default class ElasticsearchMemoryStore {
   }
 
   async delete(id: string): Promise<string> {
+    return await this.exclusive(() => this.deleteMemory(id));
+  }
+
+  private async deleteMemory(id: string): Promise<string> {
     await this.ensureIndex();
 
     try {
-      await this.request(`/${this.index}/_doc/${encodeURIComponent(id)}`, {
+      await this.request(`/${this.index}/_doc/${encodeURIComponent(id)}?refresh=true`, {
         method: 'DELETE',
       });
     } catch (error) {
@@ -173,12 +209,10 @@ export default class ElasticsearchMemoryStore {
   }
 
   async ensureIndex(): Promise<void> {
-    if (!this.indexReady) {
-      this.indexReady = this.createIndexIfMissing().catch((error) => {
-        this.indexReady = undefined;
-        throw error;
-      });
-    }
+    this.indexReady ??= this.createIndexIfMissing().catch((error) => {
+      this.indexReady = undefined;
+      throw error;
+    });
     await this.indexReady;
   }
 
@@ -224,24 +258,27 @@ export default class ElasticsearchMemoryStore {
   private async request<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
+      let response: Response;
       try {
-        const response = await fetch(`${this.url}${path}`, {
+        response = await fetch(`${this.url}${path}`, {
           ...init,
           headers: this.headers(init.headers),
           signal: AbortSignal.timeout(10_000),
         });
-        if (response.ok) {
-          return (await response.json()) as T;
-        }
-        const body = await response.text();
-        if (attempt === 2 || (response.status !== 429 && response.status < 500)) {
-          throw new Error(`Elasticsearch ${response.status}: ${body}`);
-        }
       } catch (error) {
         lastError = error;
         if (attempt === 2) {
           throw error;
         }
+        continue;
+      }
+      if (response.ok) {
+        return (await response.json()) as T;
+      }
+      const body = await response.text();
+      lastError = new Error(`Elasticsearch ${response.status}: ${body}`);
+      if (attempt === 2 || (response.status !== 429 && response.status < 500)) {
+        throw lastError;
       }
     }
     throw lastError instanceof Error ? lastError : new Error('Elasticsearch request failed');
@@ -262,8 +299,7 @@ export default class ElasticsearchMemoryStore {
     }
     const username = process.env.ELASTICSEARCH_USERNAME?.trim();
     const password = process.env.ELASTICSEARCH_PASSWORD;
-    return username && password
-      ? `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`
-      : undefined;
+    const authString = username && password ? `${username}:${password}` : undefined;
+    return authString ? `Basic ${Buffer.from(authString).toString('base64')}` : undefined;
   }
 }

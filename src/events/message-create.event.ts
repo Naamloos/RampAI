@@ -1,3 +1,7 @@
+/* eslint-disable @typescript-eslint/no-unsafe-member-access */
+/* eslint-disable @typescript-eslint/no-unsafe-call */
+/* eslint-disable @typescript-eslint/no-unsafe-argument */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment */
 import type {
   Client,
   Events,
@@ -9,16 +13,28 @@ import type {
   PartialPollAnswer,
   PartialUser,
   PollAnswer,
-  TextChannel,
   User,
 } from 'discord.js';
-import { ActivityType } from 'discord.js';
+import {
+  ActivityType,
+  ContainerBuilder,
+  MessageFlags,
+  TextChannel,
+  TextDisplayBuilder,
+} from 'discord.js';
 import { AsyncEventHandler } from '../@types/event-handler.js';
 import ScheduledMessageStore from '../discord/scheduled-message.store.js';
+import { discordImageKey, downloadImage, IMAGE_BYTE_LIMIT } from '../discord/image-cache.js';
 import OllamaService from '../llm/ollama.service.js';
+import { summarizeToolResult } from '../llm/tools.js';
 import type { DiscordAction } from '../llm/tools.js';
+import QRCode from 'qrcode';
+import { readAttachmentPage } from '../discord/read-attachment.js';
 
 const DISCORD_MESSAGE_LIMIT = 2000;
+const THINKING_COMPONENT_ID = 918273;
+const TOOL_SUMMARY_COMPONENT_ID = 918274;
+const TOOL_SUMMARY_LINE_LIMIT = 20;
 
 function messageLimit(): number {
   const value = Number(process.env.MESSAGE_LIMIT ?? 50);
@@ -28,6 +44,8 @@ function messageLimit(): number {
 export default class MessageCreateEvent extends AsyncEventHandler<Events.MessageCreate> {
   private readonly scheduledMessages = new ScheduledMessageStore();
   private processing = false;
+  private readonly pendingActivities: string[] = [];
+  private omittedActivities = 0;
 
   constructor(client: Client) {
     super(client);
@@ -53,7 +71,11 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
     if (!updated || updated.author.bot || !this.isConfiguredChannel(updated.channelId)) {
       return;
     }
-    await this.processChannel(updated.channel as TextChannel, 'message_update');
+    await this.processChannel(
+      updated.channel as TextChannel,
+      'message_update',
+      `Message ${updated.id} edited: ${updated.content.slice(0, 300)}`,
+    );
   }
 
   async handleDelete(message: Message | PartialMessage): Promise<void> {
@@ -82,7 +104,7 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
     const message = reaction.message.partial
       ? await reaction.message.fetch().catch(() => undefined)
       : reaction.message;
-    if (!message) {
+    if (!message || this.isStatusMessage(message)) {
       return;
     }
     const emoji = reaction.emoji.id
@@ -118,7 +140,14 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
       return;
     }
 
-    const latest = (await channel.messages.fetch({ limit: 1 })).first();
+    if (this.pendingActivities.length || OllamaService.getInstance().hasPendingMessages()) {
+      await this.processChannel(channel, 'queued_activity');
+      return;
+    }
+
+    const latest = (await channel.messages.fetch({ limit: 10 })).find(
+      (message) => !this.isStatusMessage(message),
+    );
     if (
       latest &&
       latest.author.id !== this.client.user?.id &&
@@ -132,7 +161,7 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
       await this.processChannel(
         channel,
         'reflection_tick',
-        'Silently reflect on recent relationships, durable memories, and gradual personality development. Consolidate or correct memories and update custom personality instructions only when experience supports it.',
+        'Silently reflect on recent relationships and durable memories. Use your own discretion to decide whether to adapt your custom personality instructions using update_system_prompt. You may initiate changes without a request, or leave instructions unchanged. Consolidate or correct memories where useful.',
         false,
       );
     }
@@ -149,33 +178,63 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
     allowPublicResponse = true,
   ): Promise<void> {
     if (this.processing) {
+      if (trigger !== 'autonomous_tick' && trigger !== 'reflection_tick') {
+        this.pendingActivities.push(`${trigger}: ${activity ?? 'New channel activity.'}`);
+        if (this.pendingActivities.length > 50) {
+          this.pendingActivities.shift();
+          this.omittedActivities += 1;
+        }
+      }
       return;
     }
     this.processing = true;
     try {
-      const recent = Array.from(
-        (await channel.messages.fetch({ limit: messageLimit() })).values(),
-      ).reverse();
-      const known = new Set(recent.map((message) => message.id));
-      const referenceIds = [
-        ...new Set(
-          recent
-            .map((message) => message.reference?.messageId)
-            .filter((id): id is string => typeof id === 'string' && !known.has(id)),
-        ),
-      ].slice(0, 10);
-      const referenced = (
-        await Promise.all(
-          referenceIds.map((id) => channel.messages.fetch(id).catch(() => undefined)),
-        )
-      ).filter((message): message is Message => Boolean(message));
-      const messages = [...referenced, ...recent].sort(
-        (left, right) => left.createdTimestamp - right.createdTimestamp,
-      );
-      await this.processMessages(channel, messages, trigger, activity, allowPublicResponse);
+      if (trigger === 'queued_activity') {
+        activity = this.pendingActivities.splice(0).join('\n');
+      }
+      do {
+        await this.readAndProcessChannel(channel, trigger, activity, allowPublicResponse);
+        activity = [
+          ...(this.omittedActivities
+            ? [`${this.omittedActivities} earlier events coalesced; use current channel state.`]
+            : []),
+          ...this.pendingActivities.splice(0),
+        ].join('\n');
+        this.omittedActivities = 0;
+        trigger = 'queued_activity';
+        allowPublicResponse = true;
+      } while (activity || OllamaService.getInstance().hasPendingMessages());
     } finally {
       this.processing = false;
     }
+  }
+
+  private async readAndProcessChannel(
+    channel: TextChannel,
+    trigger: string,
+    activity?: string,
+    allowPublicResponse = true,
+  ): Promise<void> {
+    const recent = Array.from((await channel.messages.fetch({ limit: messageLimit() })).values())
+      .filter((message) => !this.isStatusMessage(message))
+      .reverse();
+    const known = new Set(recent.map((message) => message.id));
+    const referenceIds = [
+      ...new Set(
+        recent
+          .map((message) => message.reference?.messageId)
+          .filter((id): id is string => typeof id === 'string' && !known.has(id)),
+      ),
+    ].slice(0, 10);
+    const referenced = (
+      await Promise.all(referenceIds.map((id) => channel.messages.fetch(id).catch(() => undefined)))
+    ).filter((message): message is Message<true> =>
+      Boolean(message && !this.isStatusMessage(message)),
+    );
+    const messages = [...referenced, ...recent].sort(
+      (left, right) => left.createdTimestamp - right.createdTimestamp,
+    );
+    await this.processMessages(channel, messages, trigger, activity, allowPublicResponse);
   }
 
   private async processMessages(
@@ -190,47 +249,99 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
       return;
     }
 
-    if (allowPublicResponse) {
-      await channel.sendTyping().catch((error) => console.warn('Failed to send typing:', error));
-    }
+    const thinking = allowPublicResponse
+      ? await channel
+        .send({
+          flags: MessageFlags.IsComponentsV2 | MessageFlags.SuppressNotifications,
+          components: [
+            new ContainerBuilder()
+              .setId(THINKING_COMPONENT_ID)
+              .setAccentColor(0x5865f2)
+              .addTextDisplayComponents(new TextDisplayBuilder().setContent('Thinking…')),
+          ],
+          allowedMentions: { parse: [] },
+        })
+        .catch((error) => {
+          console.warn('Failed to send thinking message:', error);
+          return undefined;
+        })
+      : undefined;
 
-    const reply = await ollama.processFromChat(
-      messages,
-      channel.guild.emojis.cache.map((emoji) => emoji),
-      channel.guild.members.cache.map((member) => member),
-      trigger,
-      (action) => this.executeAction(channel, messages, action),
-      activity,
-      allowPublicResponse,
-    );
+    let summaryMessage: Message | undefined;
+    const summaries: string[] = [];
+    let summaryCount = 0;
+    try {
+      const reply = await ollama.processFromChat(
+        messages,
+        channel.guild.emojis.cache.map((emoji) => emoji),
+        channel.guild.members.cache.map((member) => member),
+        trigger,
+        (action) => this.executeAction(channel, messages, action),
+        activity,
+        allowPublicResponse,
+        async (name, result, args) => {
+          summaryCount += 1;
+          summaries.push(this.summarizeToolResult(name, result, args));
+          while (summaries.length > TOOL_SUMMARY_LINE_LIMIT || summaries.join('\n').length > 3500) {
+            summaries.shift();
+          }
+          const omitted = summaryCount - summaries.length;
+          const components = [
+            new ContainerBuilder()
+              .setId(TOOL_SUMMARY_COMPONENT_ID)
+              .setAccentColor(0x5865f2)
+              .addTextDisplayComponents(
+                new TextDisplayBuilder().setContent(
+                  [...(omitted ? [`${omitted} earlier calls omitted.`] : []), ...summaries].join(
+                    '\n',
+                  ),
+                ),
+              ),
+          ];
+          if (summaryMessage) {
+            await summaryMessage.edit({ components, allowedMentions: { parse: [] } });
+          } else {
+            summaryMessage = await channel.send({
+              flags: MessageFlags.IsComponentsV2 | MessageFlags.SuppressNotifications,
+              components,
+              allowedMentions: { parse: [] },
+            });
+          }
+        },
+      );
 
-    if (!reply) {
-      return;
-    }
-    const latestMessageId = reply.latestMessageId ?? messages.at(-1)?.id;
-    if (!reply.response) {
+      if (!reply) {
+        return;
+      }
+      const latestMessageId = reply.latestMessageId ?? messages.at(-1)?.id;
+      if (!reply.response) {
+        if (latestMessageId) {
+          await ollama.recordProcessedMessage(latestMessageId, trigger);
+        }
+        return;
+      }
+      const publicResponse = this.applyMentionPolicy(channel, messages, reply.response);
+      if (!publicResponse) {
+        if (latestMessageId) {
+          await ollama.recordProcessedMessage(latestMessageId, trigger);
+        }
+        return;
+      }
+      if (this.isRepeatedBotMessage(messages, publicResponse)) {
+        console.warn('Skipped repeated bot response');
+        if (latestMessageId) {
+          await ollama.recordProcessedMessage(latestMessageId, trigger);
+        }
+        return;
+      }
+      await this.sendChunks(channel, publicResponse, trigger);
       if (latestMessageId) {
         await ollama.recordProcessedMessage(latestMessageId, trigger);
       }
-      return;
-    }
-    const publicResponse = this.applyMentionPolicy(channel, messages, reply.response);
-    if (!publicResponse) {
-      if (latestMessageId) {
-        await ollama.recordProcessedMessage(latestMessageId, trigger);
-      }
-      return;
-    }
-    if (this.isRepeatedBotMessage(messages, publicResponse)) {
-      console.warn('Skipped repeated bot response');
-      if (latestMessageId) {
-        await ollama.recordProcessedMessage(latestMessageId, trigger);
-      }
-      return;
-    }
-    await this.sendChunks(channel, publicResponse, trigger);
-    if (latestMessageId) {
-      await ollama.recordProcessedMessage(latestMessageId, trigger);
+    } finally {
+      await thinking
+        ?.delete()
+        .catch((error) => console.warn('Failed to remove thinking message:', error));
     }
   }
 
@@ -239,6 +350,114 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
     messages: Message<boolean>[],
     action: DiscordAction,
   ): Promise<unknown> {
+    if (action.type === 'create_file') {
+      const sent = await channel.send({
+        files: [{ attachment: Buffer.from(action.content, 'utf8'), name: action.filename }],
+        allowedMentions: { parse: [] },
+      });
+      await OllamaService.getInstance().recordDiscordMessage(sent, 'tool:create_file');
+      return { tool: action.type, ok: true, message_id: sent.id, filename: action.filename };
+    }
+
+    if (action.type === 'read_attachment' || action.type === 'list_reaction_users') {
+      const target = await channel.messages.fetch({ message: action.messageId, force: true });
+      if (this.isStatusMessage(target)) return { tool: action.type, ok: false, error: 'This is a bot status message.' };
+      if (action.type === 'read_attachment') {
+        const attachment = target.attachments.get(action.attachmentId);
+        if (!attachment) return { tool: action.type, ok: false, error: 'Attachment not found on this message.' };
+        return { tool: action.type, ok: true, message_id: target.id, ...await readAttachmentPage(attachment, action.offset) };
+      }
+      const customId = /^<a?:[A-Za-z0-9_]+:([0-9]+)>$/.exec(action.emoji)?.[1];
+      const reaction = target.reactions.cache.find((entry) =>
+        customId ? entry.emoji.id === customId : entry.emoji.name === action.emoji,
+      );
+      if (!reaction) return { tool: action.type, ok: false, error: 'Reaction not found on this message.' };
+      const users = await reaction.users.fetch({ limit: action.limit, type: action.reactionType, ...(action.after ? { after: action.after } : {}) });
+      return {
+        tool: action.type,
+        ok: true,
+        message_id: target.id,
+        reaction_type: action.reactionType === 1 ? 'burst' : 'normal',
+        users: users.map((user) => ({ id: user.id, username: user.username, display_name: user.globalName, bot: user.bot })),
+        next_after: users.size === action.limit ? users.last()?.id ?? null : null,
+      };
+    }
+
+    if (action.type === 'generate_qr_code') {
+      const version = Math.max(
+        2,
+        QRCode.create(action.text, { errorCorrectionLevel: 'M' }).version,
+      );
+      const image = await QRCode.toBuffer(action.text, {
+        type: 'png',
+        width: 512,
+        version,
+        errorCorrectionLevel: 'M',
+      });
+      const message = await channel.send({ files: [{ attachment: image, name: 'qr-code.png' }] });
+      return { tool: action.type, ok: true, message_id: message.id };
+    }
+
+    if (action.type === 'list_scheduled_messages') {
+
+      return { tool: action.type, ok: true, messages: await this.scheduledMessages.list() };
+    }
+
+    if (action.type === 'cancel_scheduled_message') {
+
+      const cancelled = await this.scheduledMessages.cancel(action.id);
+      return {
+        tool: action.type,
+        ok: cancelled,
+        id: action.id,
+        ...(cancelled ? {} : { error: 'Reminder not found or already dispatched.' }),
+      };
+    }
+
+    if (action.type === 'list_pinned_messages') {
+      const pins = await channel.messages.fetchPins({
+        limit: action.limit,
+        ...(action.before ? { before: action.before } : {}),
+      });
+      return {
+        tool: action.type,
+        ok: true,
+        hasMore: pins.hasMore,
+        next_before: pins.hasMore ? pins.items.at(-1)?.pinnedAt.toISOString() : undefined,
+        messages: pins.items
+          .filter((pin) => !this.isStatusMessage(pin.message))
+          .map((pin) => ({
+            ...this.messageDetails(pin.message),
+            pinnedAt: pin.pinnedAt.toISOString(),
+          })),
+      };
+    }
+
+    if (
+      action.type === 'get_message' ||
+      action.type === 'get_poll_results' ||
+      action.type === 'end_poll'
+    ) {
+      const target = await channel.messages.fetch({ message: action.messageId, force: true });
+      if (this.isStatusMessage(target)) {
+        return { tool: action.type, ok: false, error: 'This is a bot status message.' };
+      }
+      if (action.type === 'get_message') {
+        return { tool: action.type, ok: true, message: this.messageDetails(target) };
+      }
+      if (!target.poll) {
+        return { tool: action.type, ok: false, error: 'Message has no poll.' };
+      }
+      if (action.type === 'end_poll') {
+        if (target.author.id !== this.client.user?.id) {
+          return { tool: action.type, ok: false, error: 'Only bot-authored polls can be ended.' };
+        }
+        const ended = await target.poll.end();
+        return { tool: action.type, ok: true, message: this.messageDetails(ended) };
+      }
+      return { tool: action.type, ok: true, message: this.messageDetails(target) };
+    }
+
     if (action.type === 'change_nickname') {
       const member = channel.guild.members.me;
       if (!member) {
@@ -246,6 +465,48 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
       }
       await member.setNickname(action.nickname);
       return { tool: action.type, ok: true, nickname: action.nickname };
+    }
+
+    if (action.type === 'change_profile_picture') {
+      if (!this.client.user) {
+        return { tool: action.type, ok: false, error: 'Bot user is unavailable.' };
+      }
+      let imageUrl = action.imageUrl;
+      if (action.messageId) {
+        const message = await this.fetchMessage(channel, messages, action.messageId);
+        const candidates = message.attachments.filter(
+          (attachment) =>
+            attachment.size <= IMAGE_BYTE_LIMIT &&
+            (attachment.contentType?.startsWith('image/') ||
+              /\.(?:png|jpe?g|webp)$/i.test(attachment.name)) &&
+            Boolean(discordImageKey(attachment.url)),
+        );
+        const attachment = action.attachmentId
+          ? candidates.get(action.attachmentId)
+          : candidates.size === 1
+            ? candidates.first()
+            : undefined;
+        if (!attachment) {
+          return {
+            tool: action.type,
+            ok: false,
+            error:
+              candidates.size > 1 && !action.attachmentId
+                ? 'Multiple uploaded images found; provide attachment_id.'
+                : 'Uploaded image not found or unsupported.',
+            attachments: candidates.map((candidate) => ({
+              id: candidate.id,
+              name: candidate.name,
+            })),
+          };
+        }
+        imageUrl = attachment.url;
+      }
+      if (!imageUrl) {
+        return { tool: action.type, ok: false, error: 'No image selected.' };
+      }
+      await this.client.user.setAvatar(Buffer.from(await downloadImage(imageUrl)));
+      return { tool: action.type, ok: true };
     }
 
     if (action.type === 'get_member_presence') {
@@ -406,14 +667,11 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
   }
 
   private async sendDueMessages(channel: TextChannel): Promise<void> {
-    for (const entry of await this.scheduledMessages.takeDue()) {
-      try {
-        await this.sendChunks(channel, entry.content, 'scheduled_message');
-      } catch (error) {
-        await this.scheduledMessages.restore(entry);
-        throw error;
-      }
-    }
+    await this.scheduledMessages.deliverDue(async (entry) => {
+      const [first, ...remaining] = this.splitMessage(entry.content);
+      if (first) { await this.sendChunks(channel, first, 'scheduled_message'); }
+      return remaining.length ? remaining.join('\n') : undefined;
+    });
   }
 
   private async sendChunks(channel: TextChannel, text: string, trigger: string): Promise<void> {
@@ -472,17 +730,14 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
       }
     }
 
-    return this.sanitizeOutgoingText(content).replace(
-      /<@!?(\d+)>/g,
-      (mention, id: string) => (allowed.has(id) ? mention : ''),
+    return this.sanitizeOutgoingText(content).replace(/<@!?(\d+)>/g, (mention, id: string) =>
+      allowed.has(id) ? mention : '',
     );
   }
 
   private allowedMentions(content: string) {
     const users = new Set(
-      [...content.matchAll(/<@!?(\d+)>/g)].flatMap((match) =>
-        match[1] ? [match[1]] : [],
-      ),
+      [...content.matchAll(/<@!?(\d+)>/g)].flatMap((match) => (match[1] ? [match[1]] : [])),
     );
 
     return {
@@ -508,7 +763,11 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
       }
       results.push(
         ...page
-          .filter((message) => message.content.toLocaleLowerCase().includes(normalized))
+          .filter(
+            (message) =>
+              !this.isStatusMessage(message) &&
+              message.content.toLocaleLowerCase().includes(normalized),
+          )
           .values(),
       );
       before = page.last()?.id;
@@ -528,6 +787,61 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
       (message) =>
         message.author.id === this.client.user?.id && this.normalizeText(message.content) === text,
     );
+  }
+
+  private isStatusMessage(message: Message): boolean {
+    return (
+      message.author.id === this.client.user?.id &&
+      message.components.some((component) =>
+        [THINKING_COMPONENT_ID, TOOL_SUMMARY_COMPONENT_ID].includes(component.toJSON().id ?? 0),
+      )
+    );
+  }
+
+  private summarizeToolResult(
+    name: string,
+    result: unknown,
+    args?: Record<string, unknown>,
+  ): string {
+    return summarizeToolResult(name, result, args);
+  }
+  private messageDetails(message: Message) {
+    return {
+      id: message.id,
+      author: { id: message.author.id, displayName: message.author.displayName },
+      content: message.content,
+      components: message.components.map((component) => component.toJSON()),
+      createdAt: message.createdAt.toISOString(),
+      replyTo: message.reference?.messageId,
+      attachments: message.attachments.map((attachment) => ({
+        id: attachment.id,
+        name: attachment.name,
+        url: attachment.url,
+        contentType: attachment.contentType,
+      })),
+      embeds: message.embeds.map((embed) => ({
+        title: embed.title,
+        description: embed.description,
+        url: embed.url,
+      })),
+      reactions: message.reactions.cache.map((reaction) => ({
+        emoji: reaction.emoji.toString(),
+        count: reaction.count,
+      })),
+      poll: message.poll
+        ? {
+          question: message.poll.question.text,
+          answers: message.poll.answers.map((answer) => ({
+            id: answer.id,
+            text: answer.text,
+            votes: answer.voteCount,
+          })),
+          expiresAt: message.poll.expiresAt?.toISOString(),
+          allowMultiselect: message.poll.allowMultiselect,
+          resultsFinalized: message.poll.resultsFinalized,
+        }
+        : undefined,
+    };
   }
 
   private normalizeText(text: string): string {
@@ -551,7 +865,7 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
     if (custom) {
       const [, animated, name, id] = custom;
       const guildEmoji = channel.guild.emojis.cache.get(id ?? '');
-      return guildEmoji?.name === name && (animated === 'a') === guildEmoji.animated
+      return guildEmoji && guildEmoji.name === name && (animated === 'a') === guildEmoji.animated
         ? this.reactionText(guildEmoji)
         : undefined;
     }
