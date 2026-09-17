@@ -21,7 +21,7 @@ Select a local provider with `AI_PROVIDER=ollama` (default) or `AI_PROVIDER=lmst
 
 Runtime limits:
 
-- Tool chains continue until the model returns a final response or `no_response`. Context compaction, individual request timeouts, tool argument validation, and Discord rate limits still apply.
+- Tool chains and responses continue until the model finishes or returns `no_response`. There is no application response-length cap or model-request timeout; tool argument validation and Discord rate limits still apply.
 - Fast local defaults use `qwen3.5:4b` and a 16,384-token context. Responses are not generation-capped and are split into Discord-sized chunks.
 - Every request budgets for AI SDK tool schemas, output, and chat-template overhead. `CONTEXT_CHAR_LIMIT` optionally lowers the automatic input ceiling; text is counted in UTF-8 bytes. Old exchanges are removed before reference catalogs or current content are shortened. Core rules and custom instructions stay intact, and custom-instruction edits refresh on the next model call. Edits that leave insufficient request space are rejected before saving.
 - Token and image costs vary by model: context overflow retries with a smaller input budget, then reports an actionable message if the core instructions and current exchange cannot fit. It does not increase the configured context or GPU allocation automatically.

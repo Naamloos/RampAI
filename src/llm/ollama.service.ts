@@ -472,9 +472,6 @@ ${relevantMemories
     let budget = characterLimit;
     const provider = this.provider();
     const model = provider(process.env.AI_MODEL ?? process.env.OLLAMA_MODEL ?? 'gemma4:e4b');
-    const configuredTimeout = Number(process.env.AI_TIMEOUT_MS ?? process.env.OLLAMA_TIMEOUT_MS ?? 120000);
-    const timeoutMs =
-      Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 120000;
     const configuredAttempts = Number(process.env.AI_ATTEMPTS ?? process.env.OLLAMA_ATTEMPTS ?? 2);
     const attempts = Number.isInteger(configuredAttempts)
       ? Math.min(3, Math.max(1, configuredAttempts))
@@ -522,7 +519,6 @@ ${relevantMemories
           ),
           tools: sdkTools,
           maxRetries: 0,
-          timeout: timeoutMs,
           providerOptions: { lmstudio: { enable_thinking: this.thinkingEnabled() } },
           stopWhen: [isLoopFinished(), () => stopped],
         });
