@@ -2,14 +2,14 @@ import { watchFile } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { Emoji, GuildMember, Message } from 'discord.js';
-import type { Message as OllamaMessage, ToolCall } from 'ollama';
-import ollama from 'ollama';
+import { generateText, isLoopFinished, jsonSchema, tool } from 'ai';
+import type { ModelMessage, ToolSet, UserModelMessage } from 'ai';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { buildSystemPrompt } from '../constants/system.js';
 import ElasticsearchMemoryStore from '../memory/elasticsearch-memory.store.js';
 import { compactToolArguments, compactToolResult, executeRegisteredTool, tools } from './tools.js';
 import type { AiResult, DiscordAction } from './tools.js';
 import {
-  boundedToolResult,
   ContextBudgetError,
   contextLimits,
   fitContext,
@@ -27,6 +27,7 @@ const ATTACHMENT_BYTE_LIMIT = 100_000;
 const ATTACHMENT_CACHE_LIMIT = 64;
 const ATTACHMENT_CACHE_TTL_MS = 10 * 60_000;
 const SEARCH_TIMEOUT_MS = 10_000;
+type OllamaMessage = ModelMessage;
 interface ChatStateEntry {
   action:
     | 'run_start'
@@ -49,7 +50,6 @@ export default class OllamaService {
   private readonly memory = new ElasticsearchMemoryStore();
   private readonly imageCache = new DiscordImageCache();
   private readonly pendingMessages: Message[] = [];
-  private readonly recentDiscordActions = new Map<string, number>();
   private readonly approvedProfileImageUrls = new Set<string>();
   private readonly attachmentCache = new Map<
     string,
@@ -167,127 +167,37 @@ export default class OllamaService {
         allowPublicResponse,
         attachmentBudget,
       );
-      const completedToolCalls = new Set<string>();
-      let canRespond = allowPublicResponse;
-      let latestMessageId = chat.at(-1)?.id;
-      const configuredToolSteps = Number(process.env.MAX_TOOL_STEPS ?? 8);
-      const maxToolSteps = Number.isInteger(configuredToolSteps)
-        ? Math.min(20, Math.max(1, configuredToolSteps))
-        : 8;
-      for (let i = 0; i < maxToolSteps;) {
-        const pendingMessageId = await this.insertPendingMessages(messages, attachmentBudget);
-        if (pendingMessageId) {
-          latestMessageId = pendingMessageId;
-          canRespond = true;
-          messages.push({
-            role: 'system',
-            content:
-              'New human messages arrived. End silent reflection and respond normally if useful.',
-          });
-        }
-        const response = await this.chatWithTimeout(messages);
-        i += 1;
-        const rawContent = response.message.content;
-        response.message.content = response.message.content.replace(
-          /^\s*<(think(?:ing)?)>[\s\S]*?<\/\1>\s*/i,
-          '',
-        );
-        if (response.message.content !== rawContent) {
-          console.log('Removed private thinking markup from Ollama output');
-        }
-        if (this.pendingMessages.length > 0) {
-          console.log('Discarding stale Ollama output because newer messages arrived');
-          continue;
-        }
-        const toolCalls = response.message.tool_calls ?? [];
-        if (toolCalls.length === 0) {
-          const textToolCall = this.parseTextToolCall(response.message.content);
-          if (textToolCall) {
-            console.warn('Recovered textual Ollama tool call');
-            response.message.content = '';
-            toolCalls.push(textToolCall);
-            response.message.tool_calls = toolCalls;
-          } else if (this.hasTextToolCallMarkup(response.message.content)) {
-            console.warn('Discarding malformed textual Ollama tool call');
-            response.message.content = '';
-          }
-        }
-        messages.push(response.message);
-        if (toolCalls.length === 0) {
-          const publicResponse = canRespond
-            ? this.sanitizePublicResponse(response.message.content)
-            : '';
-          if (publicResponse) {
-            await this.appendChatState({
-              action: 'respond',
-              at: new Date().toISOString(),
-              trigger,
-              response: publicResponse,
-            });
-            return {
-              response: publicResponse,
-              ...(latestMessageId ? { latestMessageId } : {}),
-            };
-          }
-          await this.appendChatState({
-            action: 'no_response',
-            at: new Date().toISOString(),
-            trigger,
-          });
-          return latestMessageId ? { latestMessageId } : {};
-        }
-        for (const toolCall of toolCalls) {
-          const signature = JSON.stringify([toolCall.function.name, toolCall.function.arguments]);
-          const toolResult = completedToolCalls.has(signature)
-            ? {
-                stop: false,
-                result: {
-                  tool: toolCall.function.name,
-                  ok: false,
-                  error: 'This exact tool call already completed. Do not repeat it.',
-                },
-              }
-            : await this.handleLoggedToolCall(
-                toolCall,
-                trigger,
-                canRespond ? executeAction : undefined,
-              );
-          completedToolCalls.add(signature);
-          if (canRespond && onToolResult) {
-            try {
-              await onToolResult(
-                toolCall.function.name,
-                toolResult.result,
-                toolCall.function.arguments,
-              );
-            } catch (error) {
-              console.warn('Failed to publish tool summary:', error);
-            }
-          }
-          if (toolResult.stop) {
-            return latestMessageId ? { latestMessageId } : {};
-          }
-          messages.push({
-            role: 'tool',
-            tool_name: toolCall.function.name,
-            content: boundedToolResult(toolResult.result),
-          });
-        }
+      const pendingMessageId = await this.insertPendingMessages(messages, attachmentBudget);
+      const canRespond = allowPublicResponse || !!pendingMessageId;
+      if (pendingMessageId && !allowPublicResponse) {
+        messages.push({ role: 'system', content: 'New human messages arrived. Respond normally if useful.' });
       }
-      await this.appendChatState({
-        action: 'no_response',
-        at: new Date().toISOString(),
+      const response = await this.chatWithTimeout(
+        messages,
         trigger,
-        result: { reason: 'max_steps_reached' },
-      });
-      return latestMessageId ? { latestMessageId } : {};
+        canRespond ? executeAction : undefined,
+        canRespond ? onToolResult : undefined,
+      );
+      if (response.shutdown) {
+        console.log('Self-shutdown requested; stopping bot.');
+        await chat[0]?.client.destroy();
+        process.exit(0);
+      }
+      if (this.pendingMessages.length > 0) return { latestMessageId: pendingMessageId ?? chat.at(-1)?.id };
+      const publicResponse = canRespond ? this.sanitizePublicResponse(response.text) : '';
+      if (publicResponse) {
+        await this.appendChatState({ action: 'respond', at: new Date().toISOString(), trigger, response: publicResponse });
+        return { response: publicResponse, ...(pendingMessageId || chat.at(-1)?.id ? { latestMessageId: pendingMessageId ?? chat.at(-1)?.id } : {}) };
+      }
+      await this.appendChatState({ action: 'no_response', at: new Date().toISOString(), trigger });
+      return pendingMessageId || chat.at(-1)?.id ? { latestMessageId: pendingMessageId ?? chat.at(-1)?.id } : {};
     } catch (error) {
       if (!(error instanceof ContextBudgetError) && !isContextOverflow(error)) throw error;
       console.warn('Context could not fit after compaction:', error);
       return allowPublicResponse
         ? {
             response:
-              'I could not fit this request alongside my instructions. Shorten the input or increase OLLAMA_NUM_CTX; any tool actions already reported still took place.',
+              'I could not fit this request alongside my instructions. Shorten the input or increase AI_CONTEXT_TOKENS; any tool actions already reported still took place.',
           }
         : {};
     } finally {
@@ -329,27 +239,31 @@ export default class OllamaService {
     return [
       {
         role: 'system',
-        content: buildSystemPrompt(
-          systemPrompt,
-          emojis
-            ?.filter((emoji) => emoji.id)
-            .slice(0, 30)
-            .map((emoji) => `<${emoji.animated ? 'a' : ''}:${emoji.name ?? 'emoji'}:${emoji.id}>`)
-            .join('\n'),
-          JSON.stringify(
-            selectedMembers.map((member) => ({
-              username: member.user.username,
-              nickname: member.nickname,
-              id: member.id,
-            })) ?? [],
-          ),
-          this.recentParticipants(chat),
-          `trigger=${trigger}; public_response_allowed=${allowPublicResponse}; clanker_trigger=${trigger !== 'reflection_tick' && this.hasClankerTrigger(chat)}; catalogs are partial; get_member_presence can resolve uncatalogued names${activity ? `; event=${activity.slice(-2000)}` : ''}`,
-          relevantMemories
-            .map((memory) => `[${memory.id}] ${memory.text.slice(0, 500)}`)
-            .join('\n')
-            .slice(0, 3000),
-        ),
+        content: buildSystemPrompt(systemPrompt),
+      },
+      {
+        role: 'user',
+        content: `<turn_context>
+Runtime: trigger=${trigger}; public_response_allowed=${allowPublicResponse}; clanker_trigger=${trigger !== 'reflection_tick' && this.hasClankerTrigger(chat)}; catalogs are partial; get_member_presence can resolve uncatalogued names${activity ? `; event=${activity.slice(-2000)}` : ''}
+Custom emojis: ${emojis
+          ?.filter((emoji) => emoji.id)
+          .slice(0, 30)
+          .map((emoji) => `<${emoji.animated ? 'a' : ''}:${emoji.name ?? 'emoji'}:${emoji.id}>`)
+          .join('\n') || 'none'}
+Known members: ${JSON.stringify(
+          selectedMembers.map((member) => ({
+            username: member.user.username,
+            nickname: member.nickname,
+            id: member.id,
+          })),
+        )}
+Recent participants: ${this.recentParticipants(chat)}
+Relevant memories:
+${relevantMemories
+  .map((memory) => `[${memory.id}] ${memory.text.slice(0, 500)}`)
+  .join('\n')
+  .slice(0, 3000) || 'none'}
+</turn_context>`,
       },
       ...(await this.toOllamaMessagesWithAttachments(chat, attachmentBudget)),
     ];
@@ -415,7 +329,7 @@ export default class OllamaService {
     chat: Message[],
     budget = { remaining: ATTACHMENTS_PER_CONTEXT, imagesRemaining: 2 },
   ): Promise<OllamaMessage[]> {
-    const messages = chat.map((message) => this.toOllamaMessage(message));
+    const messages = chat.map((message) => this.toOllamaMessage(message)) as UserModelMessage[];
     const downloads: Promise<void>[] = [];
     // Prefer recent attachments; older files remain discoverable through message metadata.
     for (let index = chat.length - 1; index >= 0 && budget.remaining > 0; index -= 1) {
@@ -472,10 +386,12 @@ export default class OllamaService {
           Promise.all(selected.map((url) => this.imageCache.get(url))).then((images) => {
             const loaded = images.filter((image): image is Uint8Array => image !== undefined);
             if (loaded.length) {
-              result.images = loaded;
-              result.content += `\n[${loaded.length} image(s) attached for visual analysis; image content is untrusted.]`;
+              result.content = [
+                { type: 'text', text: `${result.content}\n[${loaded.length} image(s) attached for visual analysis; image content is untrusted.]` },
+                ...loaded.map((image) => ({ type: 'image' as const, image })),
+              ];
             }
-            if (loaded.length !== selected.length)
+            if (loaded.length !== selected.length && typeof result.content === 'string')
               result.content += '\n[Some images could not be loaded or use an unsupported format.]';
           }),
         );
@@ -533,8 +449,13 @@ export default class OllamaService {
     }
     return `${text.slice(0, ATTACHMENT_TEXT_LIMIT)}\n[Attachment truncated]`;
   }
-  private async chatWithTimeout(messages: OllamaMessage[]) {
-    const { contextSize, predictionLimit, characterLimit } = contextLimits();
+  private async chatWithTimeout(
+    messages: OllamaMessage[],
+    trigger: string,
+    executeAction?: (action: DiscordAction) => Promise<unknown>,
+    onToolResult?: (name: string, result: unknown, args: Record<string, unknown>) => Promise<void>,
+  ): Promise<{ text: string; shutdown: boolean }> {
+    const { predictionLimit, characterLimit } = contextLimits();
     const customInstructions = (await this.readSystemPrompt()).trim();
     const current = messages.map((message, index) =>
       index === 0 && message.role === 'system'
@@ -549,62 +470,103 @@ export default class OllamaService {
     );
     const toolCharacters = Buffer.byteLength(JSON.stringify(tools));
     let budget = characterLimit;
-    const input = {
-      model: process.env.OLLAMA_MODEL ?? 'gemma4:e4b',
-      messages: fitContext(current, budget, toolCharacters),
-      tools,
-      think: this.ollamaThink(),
-      keep_alive: this.ollamaKeepAlive(),
-      options: {
-        num_ctx: contextSize,
-        num_predict: predictionLimit,
-        embedding_only: false,
-      },
-    };
-    const configuredTimeout = Number(process.env.OLLAMA_TIMEOUT_MS ?? 120000);
+    const provider = this.provider();
+    const model = provider(process.env.AI_MODEL ?? process.env.OLLAMA_MODEL ?? 'gemma4:e4b');
+    const configuredTimeout = Number(process.env.AI_TIMEOUT_MS ?? process.env.OLLAMA_TIMEOUT_MS ?? 120000);
     const timeoutMs =
       Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 120000;
-    const configuredAttempts = Number(process.env.OLLAMA_ATTEMPTS ?? 2);
+    const configuredAttempts = Number(process.env.AI_ATTEMPTS ?? process.env.OLLAMA_ATTEMPTS ?? 2);
     const attempts = Number.isInteger(configuredAttempts)
       ? Math.min(3, Math.max(1, configuredAttempts))
       : 2;
     console.log(
-      `Ollama request: ${input.messages.length}/${messages.length} messages, ${tools.length} tools, ${budget} input budget, ${predictionLimit} output tokens`,
+      `AI request: ${messages.length} messages, ${tools.length} tools, ${budget} input budget, ${predictionLimit} output tokens`,
     );
     let lastError: unknown;
     let contextRetries = 0;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      let timeout: NodeJS.Timeout | undefined;
       try {
-        const response = await Promise.race([
-          ollama.chat(input),
-          new Promise<never>((_resolve, reject) => {
-            timeout = setTimeout(() => {
-              ollama.abort();
-              reject(new Error(`Ollama request timed out after ${timeoutMs}ms`));
-            }, timeoutMs);
-          }),
-        ]);
-        console.log(`Ollama response: ${response.message.tool_calls?.length ?? 0} tool calls`);
-        return response;
+        let shutdown = false;
+        let stopped = false;
+        const sdkTools: ToolSet = Object.fromEntries(
+          tools.map((definition) => [
+            definition.function.name,
+            tool({
+              description: definition.function.description,
+              inputSchema: jsonSchema(definition.function.parameters),
+              execute: async (args) => {
+                const input = this.isRecord(args) ? args : {};
+                const result = await this.handleLoggedToolCall(
+                  definition.function.name,
+                  input,
+                  trigger,
+                  executeAction,
+                );
+                if (onToolResult) {
+                  void onToolResult(definition.function.name, result.result, input).catch((error) =>
+                    console.warn('Failed to publish tool summary:', error),
+                  );
+                }
+                stopped ||= result.stop;
+                shutdown ||= result.stop && definition.function.name === 'self_shutdown';
+                return result.result;
+              },
+            }),
+          ]),
+        );
+        const response = await generateText({
+          model,
+          instructions: this.instructions(current),
+          messages: fitContext(current, budget, toolCharacters).filter(
+            (message) => message.role !== 'system',
+          ),
+          tools: sdkTools,
+          maxRetries: 0,
+          timeout: timeoutMs,
+          providerOptions: { lmstudio: { enable_thinking: this.thinkingEnabled() } },
+          stopWhen: [isLoopFinished(), () => stopped],
+        });
+        console.log(`AI response: ${response.toolCalls.length} tool calls`);
+        return { text: response.text.replace(/^\s*<(think(?:ing)?)>[\s\S]*?<\/\1>\s*/i, ''), shutdown };
       } catch (error) {
         lastError = error;
         if (isContextOverflow(error) && contextRetries < 2) {
           contextRetries += 1;
           budget = Math.floor(budget * 0.75);
-          input.messages = fitContext(current, budget, toolCharacters);
           console.warn(`Retrying context overflow with ${budget} input budget`);
           attempt -= 1;
           continue;
         }
-        console.warn(`Ollama attempt ${attempt}/${attempts} failed:`, error);
-      } finally {
-        if (timeout) {
-          clearTimeout(timeout);
-        }
+        console.warn(`AI attempt ${attempt}/${attempts} failed:`, error);
       }
     }
-    throw lastError instanceof Error ? lastError : new Error('Ollama request failed');
+    throw lastError instanceof Error ? lastError : new Error('AI request failed');
+  }
+  private provider() {
+    const name = (process.env.AI_PROVIDER ?? 'ollama').toLowerCase();
+    if (name !== 'ollama' && name !== 'lmstudio') {
+      throw new Error('AI_PROVIDER must be "ollama" or "lmstudio".');
+    }
+    const baseURL =
+      process.env.AI_BASE_URL ??
+      (name === 'lmstudio'
+        ? process.env.LMSTUDIO_BASE_URL ?? 'http://localhost:1234/v1'
+        : process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434/v1');
+    return createOpenAICompatible({ name, baseURL, apiKey: process.env.AI_API_KEY });
+  }
+  private instructions(messages: OllamaMessage[]): string {
+    const system = messages
+      .flatMap((message) => (message.role === 'system' ? [message.content] : []))
+      .join('\n\n');
+    const think = this.thinkingEnabled();
+    const direction =
+      !think
+        ? 'Do not include private reasoning or <think> blocks in your response.'
+        : 'Use <think> blocks for private reasoning before your final response.';
+    return `${system}\n\n${direction}`;
+  }
+  private thinkingEnabled(): boolean {
+    return (process.env.AI_THINK ?? process.env.OLLAMA_THINK ?? 'false') !== 'false';
   }
   private serializeMessage(message: Message, maxContentLength?: number) {
     const content =
@@ -647,7 +609,7 @@ export default class OllamaService {
       createdAt: message.createdAt.toISOString(),
     };
   }
-  private toOllamaMessage(message: Message): OllamaMessage {
+  private toOllamaMessage(message: Message): UserModelMessage {
     const reactions = message.reactions.cache
       .map((reaction) => {
         const emoji = reaction.emoji.toString();
@@ -678,7 +640,7 @@ export default class OllamaService {
     return {
       role: message.author.id === process.env.BOT_ID ? 'assistant' : 'user',
       content: `[${metadata}]\n${message.content}`,
-    };
+    } as UserModelMessage;
   }
   private async readSystemPrompt(): Promise<string> {
     if (this.systemPromptCache !== undefined) {
@@ -782,13 +744,15 @@ export default class OllamaService {
     await write;
   }
   private async handleToolCall(
-    call: ToolCall,
+    name: string,
+    args: Record<string, unknown>,
     executeAction?: (action: DiscordAction) => Promise<unknown>,
   ): Promise<{ stop: boolean; result: unknown }> {
-    return await this.handleToolAction(call.function.name, call.function.arguments, executeAction);
+    return await this.handleToolAction(name, args, executeAction);
   }
   private async handleLoggedToolCall(
-    call: ToolCall,
+    name: string,
+    args: Record<string, unknown>,
     trigger: string,
     executeAction?: (action: DiscordAction) => Promise<unknown>,
   ): Promise<{ stop: boolean; result: unknown }> {
@@ -796,16 +760,16 @@ export default class OllamaService {
       action: 'tool_call',
       at: new Date().toISOString(),
       trigger,
-      tool: call.function.name,
-      arguments: compactToolArguments(call.function.name, call.function.arguments),
+      tool: name,
+      arguments: compactToolArguments(name, args),
     });
-    const toolResult = await this.handleToolCall(call, executeAction);
+    const toolResult = await this.handleToolCall(name, args, executeAction);
     await this.appendChatState({
       action: 'tool_result',
       at: new Date().toISOString(),
       trigger,
-      tool: call.function.name,
-      result: compactToolResult(call.function.name, toolResult.result),
+      tool: name,
+      result: compactToolResult(name, toolResult.result),
     });
     return toolResult;
   }
@@ -1150,95 +1114,13 @@ export default class OllamaService {
         },
       };
     }
-    const signature = JSON.stringify(action);
-    const shouldCooldown = ![
-      'read_attachment',
-      'list_reaction_users',
-      'search_channel_history',
-      'get_member_presence',
-      'get_message',
-      'get_poll_results',
-      'list_pinned_messages',
-      'list_scheduled_messages',
-    ].includes(action.type);
-    const configuredCooldown = Number(process.env.ACTION_COOLDOWN_MS ?? 10000);
-    const cooldown = Number.isFinite(configuredCooldown) ? Math.max(0, configuredCooldown) : 10_000;
-    const previous = this.recentDiscordActions.get(signature);
-    if (shouldCooldown && previous && Date.now() - previous < cooldown) {
-      return {
-        stop: false,
-        result: { tool: action.type, ok: false, error: 'Duplicate action suppressed.' },
-      };
-    }
     const result = await executeAction(action);
-    if (shouldCooldown && (!this.isRecord(result) || result.ok !== false)) {
-      this.recentDiscordActions.set(signature, Date.now());
-      for (const [key, at] of this.recentDiscordActions) {
-        if (Date.now() - at >= cooldown) {
-          this.recentDiscordActions.delete(key);
-        }
-      }
-    }
     return { stop: false, result };
-  }
-  private parseTextToolCall(content: string): ToolCall | undefined {
-    const match =
-      /^\s*(?:<tool_call>|<\|tool_call>)\s*(?:call:)?([A-Za-z_][A-Za-z0-9_]*)\s*(\{[\s\S]*\})\s*(?:<\/tool_call>|<tool_call\|>)\s*$/.exec(
-        content,
-      );
-    if (!match) {
-      return undefined;
-    }
-    const [, name, rawArguments] = match;
-    if (!name || !rawArguments || !tools.some((tool) => tool.function.name === name)) {
-      return undefined;
-    }
-    const args = this.parseTextToolArguments(rawArguments);
-    if (!args) {
-      return undefined;
-    }
-    return { function: { name, arguments: args } };
-  }
-  private hasTextToolCallMarkup(content: string): boolean {
-    return content.includes('<tool_call>') || content.includes('<|tool_call>');
   }
   private sanitizePublicResponse(content: string): string {
     return content.replace(/^(?:\s*\[Discord message \d+[^\]\r\n]*\]\s*)+/i, '').trim();
   }
   private isRecord(value: unknown): value is Record<string, unknown> {
     return !!value && typeof value === 'object' && !Array.isArray(value);
-  }
-  private parseTextToolArguments(rawArguments: string): Record<string, unknown> | undefined {
-    try {
-      const parsed = JSON.parse(rawArguments) as unknown;
-      return this.isRecord(parsed) ? parsed : undefined;
-    } catch {
-      const body = rawArguments.slice(1, -1);
-      if (!body.trim()) {
-        return {};
-      }
-      const args: Record<string, unknown> = {};
-      const argument =
-        /\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:<\|"\|>([\s\S]*?)<\|"\|>|(-?\d+(?:\.\d+)?|true|false|null))\s*(?:,|$)/gy;
-      while (argument.lastIndex < body.length) {
-        const match = argument.exec(body);
-        if (!match?.[1]) {
-          return undefined;
-        }
-        args[match[1]] = match[2] ?? JSON.parse(match[3] ?? 'null');
-      }
-      return args;
-    }
-  }
-  private ollamaThink(): false | 'low' | 'medium' | 'high' {
-    const value = process.env.OLLAMA_THINK;
-    if (value === 'false') {
-      return false;
-    }
-    return value === 'low' || value === 'medium' || value === 'high' ? value : 'low';
-  }
-  private ollamaKeepAlive(): string | number {
-    const value = process.env.OLLAMA_KEEP_ALIVE?.trim() || '30m';
-    return /^-?\d+$/.test(value) ? Number(value) : value;
   }
 }

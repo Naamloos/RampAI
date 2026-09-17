@@ -356,6 +356,14 @@ export const toolRegistry: BotTool[] = [
     'No additional reply.',
     async () => ({ stop: true, result: { tool: 'no_response', ok: true } }),
   ),
+  defineTool(
+    'self_shutdown',
+    'Shut down your bot process and go offline until externally restarted. This does not shut down the host computer. Send any farewell before calling this tool.',
+    [],
+    {},
+    'Bot shutting down.',
+    async () => ({ stop: true, result: { tool: 'self_shutdown', ok: true } }),
+  ),
   ...(['reply_to_message', 'edit_message'] as const).map((name) =>
     discordTool(
       name,

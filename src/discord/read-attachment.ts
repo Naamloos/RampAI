@@ -4,6 +4,8 @@ const BYTE_LIMIT = 100000;
 const PAGE_SIZE = 4000;
 
 export async function readAttachmentPage(attachment: Attachment, offset: number) {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > BYTE_LIMIT)
+    throw new Error('Offset must be an integer between 0 and 100,000.');
   if (attachment.size > BYTE_LIMIT) throw new Error('Attachment exceeds 100,000 bytes.');
   if (!attachment.contentType?.startsWith('text/') &&
     attachment.contentType?.split(';')[0] !== 'application/json' &&
@@ -37,6 +39,9 @@ export async function readAttachmentPage(attachment: Attachment, offset: number)
   }
   if (text.includes('\0')) throw new Error('Binary attachment contents are unsupported.');
   if (offset > text.length) throw new Error('Offset exceeds attachment length.');
+  if (offset > 0 && /[\uD800-\uDBFF]/.test(text[offset - 1]!) &&
+    /[\uDC00-\uDFFF]/.test(text[offset]!))
+    throw new Error('Offset splits a Unicode character; use the previous page’s next_offset.');
   let end = Math.min(text.length, offset + PAGE_SIZE);
   // Avoid splitting a UTF-16 surrogate pair between pages.
   if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;

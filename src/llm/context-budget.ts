@@ -1,11 +1,11 @@
-import type { Message } from 'ollama';
+import type { ModelMessage } from 'ai';
 
 export class ContextBudgetError extends Error {}
 
 export function contextLimits() {
-  const configured = Number(process.env.OLLAMA_NUM_CTX ?? 8192);
+  const configured = Number(process.env.AI_CONTEXT_TOKENS ?? process.env.OLLAMA_NUM_CTX ?? 8192);
   const contextSize = Number.isInteger(configured) && configured > 0 ? configured : 8192;
-  const prediction = Number(process.env.OLLAMA_NUM_PREDICT ?? 1024);
+  const prediction = Number(process.env.AI_MAX_OUTPUT_TOKENS ?? process.env.OLLAMA_NUM_PREDICT ?? 1024);
   const predictionLimit = Math.min(
     Number.isInteger(prediction) && prediction > 0 ? prediction : 1024,
     Math.max(1, Math.floor(contextSize / 4)),
@@ -43,35 +43,18 @@ export function boundedToolResult(result: unknown, limit = 4000): string {
 }
 
 // UTF-8 bytes conservatively account for non-ASCII text; images have a separate estimate.
-export function fitContext(messages: Message[], limit: number, toolCharacters: number): Message[] {
-  const system: Message[] = [];
-  const groups: Message[][] = [];
+export function fitContext(messages: ModelMessage[], limit: number, toolCharacters: number): ModelMessage[] {
+  const system: ModelMessage[] = [];
+  const groups: ModelMessage[][] = [];
   for (const message of messages) {
-    const copy = { ...message };
-    delete copy.thinking;
-    if (copy.tool_calls) {
-      copy.tool_calls = copy.tool_calls.map((call) => ({
-        ...call,
-        function: {
-          ...call.function,
-          arguments: Object.fromEntries(
-            Object.entries(call.function.arguments).map(([key, value]) => [
-              key,
-              typeof value === 'string' && value.length > 1000
-                ? `${value.slice(0, 1000)} [truncated]`
-                : value,
-            ]),
-          ),
-        },
-      }));
+    const copy = { ...message } as ModelMessage;
+    if (copy.role === 'system') {
+      copy.content = copy.content.replace(/\nSome older context was omitted to fit the context budget\.$/, '');
+      system.push(copy);
     }
-    if (copy.role === 'system') system.push(copy);
-    else if (copy.role === 'tool' && groups.at(-1)?.[0]?.tool_calls?.length)
-      groups.at(-1)!.push(copy);
     else groups.push([copy]);
   }
   const newestUser = groups.findLast((group) => group[0]?.role === 'user');
-  const newestImages = groups.findLast((group) => group.some((message) => message.images?.length));
   // Binary/base64 bytes are not text tokens. Reserve an estimate per image instead.
   const size = () => {
     const current = [...system, ...groups.flat()];
@@ -80,14 +63,21 @@ export function fitContext(messages: Message[], limit: number, toolCharacters: n
       Buffer.byteLength(
         JSON.stringify(current, (key, value: unknown) => (key === 'images' ? undefined : value)),
       ) +
-      current.reduce((total, message) => total + (message.images?.length ?? 0) * 2048, 0)
+      current.reduce(
+        (total, message) =>
+          total +
+          (Array.isArray(message.content)
+            ? message.content.filter((part) => part.type === 'image').length * 2048
+            : 0),
+        0,
+      )
     );
   };
   const budget = limit - 80;
   let omitted = false;
   while (size() > budget) {
     const removable = groups.findIndex(
-      (group, index) => group !== newestUser && group !== newestImages && index < groups.length - 1,
+      (group, index) => group !== newestUser && index < groups.length - 1,
     );
     if (removable < 0) break;
     groups.splice(removable, 1);
@@ -104,25 +94,21 @@ export function fitContext(messages: Message[], limit: number, toolCharacters: n
   }
   for (const message of groups
     .flat()
-    .sort((left, right) => right.content.length - left.content.length)) {
-    while (size() > budget && message.content.length > 256) {
+    .filter((message) => message.role !== 'tool' && typeof message.content === 'string')
+    .sort((left, right) => (typeof right.content === 'string' ? right.content.length : 0) - (typeof left.content === 'string' ? left.content.length : 0))) {
+    while (size() > budget && typeof message.content === 'string' && message.content.length > 256) {
       const length = Math.max(128, Math.floor(message.content.length / 2));
-      message.content =
-        message.role === 'tool'
-          ? boundedToolResult(
-              { truncated: true, preview: message.content.slice(0, length / 6) },
-              length,
-            )
-          : `${message.content.slice(0, Math.floor(length / 2))}\n[Content truncated; use history or lookup tools for details.]\n${message.content.slice(-Math.floor(length / 2))}`;
+      message.content = `${message.content.slice(0, Math.floor(length / 2))}\n[Content truncated; use history or lookup tools for details.]\n${message.content.slice(-Math.floor(length / 2))}`;
       omitted = true;
     }
   }
-  for (const message of groups.flat()) {
+  for (const message of groups.flat().filter((message) => message.role === 'user')) {
     if (size() <= budget) break;
-    if (message.images?.length) {
-      delete message.images;
-      message.content +=
-        '\n[Images omitted to fit context; no image pixels are available for this message.]';
+    if (Array.isArray(message.content) && message.content.some((part) => part.type === 'image')) {
+      message.content = [
+        ...message.content.filter((part) => part.type !== 'image'),
+        { type: 'text', text: '[Images omitted to fit context; no image pixels are available for this message.]' },
+      ];
       omitted = true;
     }
   }
@@ -130,7 +116,7 @@ export function fitContext(messages: Message[], limit: number, toolCharacters: n
     system[0].content += '\nSome older context was omitted to fit the context budget.';
   if (size() > limit) {
     throw new ContextBudgetError(
-      'Core instructions and current tool exchange exceed CONTEXT_CHAR_LIMIT. Increase the limit/OLLAMA_NUM_CTX or shorten custom instructions.',
+      'Core instructions and current tool exchange exceed CONTEXT_CHAR_LIMIT. Increase the limit/AI_CONTEXT_TOKENS or shorten custom instructions.',
     );
   }
   return [...system, ...groups.flat()];

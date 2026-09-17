@@ -19,7 +19,13 @@ consoleStamp.default(console, {
   },
 });
 
-process.loadEnvFile('.env');
+try {
+  process.loadEnvFile('.env');
+} catch (error) {
+  if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
+    throw error;
+  }
+}
 
 for (const name of ['DISCORD_API_TOKEN', 'DISCORD_CHANNEL_ID']) {
   if (!process.env[name]?.trim()) {
@@ -53,8 +59,11 @@ client.on(Events.MessageCreate, (message) => {
   report('Error handling message create event:', messageCreateHandler.handle(message));
 });
 
-client.on(Events.MessageUpdate, (_oldMessage, newMessage) => {
-  report('Error handling message update:', messageCreateHandler.handleUpdate(newMessage));
+client.on(Events.MessageUpdate, (oldMessage, newMessage) => {
+  report(
+    'Error handling message update:',
+    messageCreateHandler.handleUpdate(newMessage, oldMessage),
+  );
 });
 
 client.on(Events.MessageDelete, (message) => {
@@ -109,25 +118,27 @@ async function initialize(): Promise<void> {
         .addTextDisplayComponents(new TextDisplayBuilder().setContent('🟢 Bot online')),
     ],
     allowedMentions: { parse: [] },
-  });
+  }).catch((error) => console.warn('Failed to send online message:', error));
   await channel.guild.members
     .fetch({ withPresences: true })
     .catch((error) => console.warn('Failed to refresh guild members; using cache:', error));
 
-  if (Number.isFinite(botMessageIntervalMs) && botMessageIntervalMs > 0) {
-    setInterval(() => {
-      report('Error handling scheduled bot activity:', messageCreateHandler.tick(channel));
-    }, botMessageIntervalMs);
-  }
+  startInterval('Error handling scheduled bot activity:', botMessageIntervalMs, () =>
+    messageCreateHandler.tick(channel));
+  startInterval('Error sending scheduled messages:', reminderPollIntervalMs, () =>
+    messageCreateHandler.flushScheduledMessages(channel));
+}
 
-  if (Number.isFinite(reminderPollIntervalMs) && reminderPollIntervalMs > 0) {
-    setInterval(() => {
-      report(
-        'Error sending scheduled messages:',
-        messageCreateHandler.flushScheduledMessages(channel),
-      );
-    }, reminderPollIntervalMs);
-  }
+function startInterval(label: string, intervalMs: number, operation: () => Promise<void>): void {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
+  let running = false;
+  setInterval(() => {
+    if (running) return;
+    running = true;
+    report(label, operation().finally(() => {
+      running = false;
+    }));
+  }, Math.min(2_147_483_647, Math.max(1, Math.trunc(intervalMs))));
 }
 
 client.on(Events.Error, (error) => {

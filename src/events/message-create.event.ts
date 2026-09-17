@@ -44,6 +44,7 @@ function messageLimit(): number {
 export default class MessageCreateEvent extends AsyncEventHandler<Events.MessageCreate> {
   private readonly scheduledMessages = new ScheduledMessageStore();
   private processing = false;
+  private flushingScheduledMessages = false;
   private readonly pendingActivities: string[] = [];
   private omittedActivities = 0;
 
@@ -52,10 +53,10 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
   }
 
   async handle(message: OmitPartialGroupDMChannel<Message<boolean>>): Promise<void> {
-    console.log(`${message.author.displayName} (${message.author.id}): ${message.content}`);
     if (message.author.bot || !this.isConfiguredChannel(message.channel.id)) {
       return;
     }
+    console.log(`${message.author.displayName} (${message.author.id}): ${message.content}`);
 
     const ollama = OllamaService.getInstance();
     if (this.processing || ollama.getIsThinking()) {
@@ -66,11 +67,24 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
     await this.processChannel(message.channel as TextChannel, 'message_event');
   }
 
-  async handleUpdate(message: Message | PartialMessage): Promise<void> {
+  async handleUpdate(
+    message: Message | PartialMessage,
+    previous?: Message | PartialMessage,
+  ): Promise<void> {
+    if (!this.isConfiguredChannel(message.channelId) || message.author?.bot) return;
     const updated = message.partial ? await message.fetch().catch(() => undefined) : message;
     if (!updated || updated.author.bot || !this.isConfiguredChannel(updated.channelId)) {
       return;
     }
+    if (
+      previous && !previous.partial && previous.content === updated.content &&
+      previous.attachments.size === updated.attachments.size &&
+      previous.attachments.every((attachment, id) => {
+        const current = updated.attachments.get(id);
+        return current && current.name === attachment.name && current.size === attachment.size &&
+          current.contentType === attachment.contentType;
+      })
+    ) return;
     await this.processChannel(
       updated.channel as TextChannel,
       'message_update',
@@ -136,7 +150,7 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
 
   async tick(channel: TextChannel): Promise<void> {
     await this.flushScheduledMessages(channel);
-    if (OllamaService.getInstance().getIsThinking()) {
+    if (this.processing || OllamaService.getInstance().getIsThinking()) {
       return;
     }
 
@@ -168,7 +182,13 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
   }
 
   async flushScheduledMessages(channel: TextChannel): Promise<void> {
-    await this.sendDueMessages(channel);
+    if (this.flushingScheduledMessages) return;
+    this.flushingScheduledMessages = true;
+    try {
+      await this.sendDueMessages(channel);
+    } finally {
+      this.flushingScheduledMessages = false;
+    }
   }
 
   private async processChannel(
@@ -598,21 +618,28 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
 
     if (action.type === 'schedule_message') {
       const content = this.applyMentionPolicy(channel, messages, action.content);
+      if (!content) {
+        return { tool: action.type, ok: false, error: 'Message is empty after mention filtering.' };
+      }
       const scheduled = await this.scheduledMessages.schedule(content, action.delayMinutes);
       return { tool: action.type, ok: true, id: scheduled.id, dueAt: scheduled.dueAt };
     }
 
     const target = await this.fetchMessage(channel, messages, action.messageId);
+    if (this.isStatusMessage(target)) {
+      return { tool: action.type, ok: false, error: 'This is a bot status message.' };
+    }
     if (action.type === 'reply_to_message') {
       const chunks = this.splitMessage(this.applyMentionPolicy(channel, messages, action.content));
       const first = chunks.shift();
-      if (first) {
-        const sent = await target.reply({
-          content: first,
-          allowedMentions: this.allowedMentions(first),
-        });
-        await OllamaService.getInstance().recordDiscordMessage(sent, 'tool:reply_to_message');
+      if (!first) {
+        return { tool: action.type, ok: false, error: 'Message is empty after mention filtering.' };
       }
+      const sent = await target.reply({
+        content: first,
+        allowedMentions: this.allowedMentions(first),
+      });
+      await OllamaService.getInstance().recordDiscordMessage(sent, 'tool:reply_to_message');
       for (const chunk of chunks) {
         await this.sendChunks(channel, chunk, 'tool:reply_to_message');
       }
@@ -648,8 +675,16 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
       }
       if (action.type === 'edit_message') {
         const content = this.applyMentionPolicy(channel, messages, action.content);
+        if (!content || content.length > DISCORD_MESSAGE_LIMIT) {
+          return {
+            tool: action.type,
+            ok: false,
+            error:
+              'Edited message must contain 1–2,000 characters after mention filtering. Shorten it or send a new reply.',
+          };
+        }
         await target.edit({
-          content: content.slice(0, DISCORD_MESSAGE_LIMIT),
+          content,
           allowedMentions: this.allowedMentions(content),
         });
       } else {
@@ -691,7 +726,9 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
       }
       const candidate = remaining.slice(0, DISCORD_MESSAGE_LIMIT);
       const splitAt = Math.max(candidate.lastIndexOf('\n'), candidate.lastIndexOf(' '));
-      const end = splitAt > DISCORD_MESSAGE_LIMIT / 2 ? splitAt : DISCORD_MESSAGE_LIMIT;
+      let end = splitAt > DISCORD_MESSAGE_LIMIT / 2 ? splitAt : DISCORD_MESSAGE_LIMIT;
+      // Keep UTF-16 surrogate pairs together at hard message boundaries.
+      if (/[\uD800-\uDBFF]/.test(remaining[end - 1]!)) end--;
       chunks.push(remaining.slice(0, end).trimEnd());
       remaining = remaining.slice(end).trimStart();
     }
@@ -730,9 +767,9 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
       }
     }
 
-    return this.sanitizeOutgoingText(content).replace(/<@!?(\d+)>/g, (mention, id: string) =>
-      allowed.has(id) ? mention : '',
-    );
+    return this.sanitizeOutgoingText(content)
+      .replace(/<@!?(\d+)>/g, (mention, id: string) => allowed.has(id) ? mention : '')
+      .trim();
   }
 
   private allowedMentions(content: string) {
@@ -757,7 +794,10 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
       : 500;
 
     for (let scanned = 0; scanned < scanLimit && results.length < limit; scanned += 100) {
-      const page = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+      const page = await channel.messages.fetch({
+        limit: Math.min(100, scanLimit - scanned),
+        ...(before ? { before } : {}),
+      });
       if (page.size === 0) {
         break;
       }
@@ -782,10 +822,10 @@ export default class MessageCreateEvent extends AsyncEventHandler<Events.Message
   }
 
   private isRepeatedBotMessage(messages: Message<boolean>[], response: string): boolean {
-    const text = this.normalizeText(response);
-    return messages.some(
-      (message) =>
-        message.author.id === this.client.user?.id && this.normalizeText(message.content) === text,
+    const latest = messages.findLast((message) => !this.isStatusMessage(message));
+    return Boolean(
+      latest && latest.author.id === this.client.user?.id &&
+      this.normalizeText(latest.content) === this.normalizeText(response),
     );
   }
 

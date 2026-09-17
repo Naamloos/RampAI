@@ -2,11 +2,11 @@
 
 Experimental autonomous AI "agent" that is fully isolated to a single Discord channel.
 
-Uses [Ollama](https://ollama.com/) to run AI models locally.
+Uses the [Vercel AI SDK](https://ai-sdk.dev/) with local [Ollama](https://ollama.com/) or [LM Studio](https://lmstudio.ai/) models.
 
 Web search uses Bing's keyless RSS and image-search endpoints by default. Override the origin with `WEB_SEARCH_BASE_URL`; Wikipedia search uses the public MediaWiki API directly.
 
-Tools are registered in `src/llm/tools.ts`; each registry entry supplies its schema, validation, execution, summary, and optional log compaction. The same registry generates Ollama's native tool list and the system-prompt catalog. Profile pictures may come from a current-turn web/Wikipedia image result or an uploaded Discord image.
+Tools are registered in `src/llm/tools.ts`; each registry entry supplies its schema, validation, execution, summary, and optional log compaction. The same registry generates the AI SDK tool list and the system-prompt catalog. Profile pictures may come from a current-turn web/Wikipedia image result or an uploaded Discord image.
 
 Additional tools:
 
@@ -17,10 +17,13 @@ Additional tools:
 
 Both `npm start` and `npm run dev` restart the bot when `.env` changes.
 
+Select a local provider with `AI_PROVIDER=ollama` (default) or `AI_PROVIDER=lmstudio`; set `AI_MODEL` and, if needed, `AI_BASE_URL`. The defaults are `http://localhost:11434/v1` for Ollama and `http://localhost:1234/v1` for LM Studio. Set `AI_THINK=false` to suppress private reasoning, or any other value to enable it.
+
 Runtime limits:
 
-- Fast local defaults use `qwen3.5:4b`, an 8,192-token context, and disabled thinking. Output defaults to 1,024 tokens; `OLLAMA_NUM_PREDICT` overrides this up to one quarter of the context. Discord responses are split into message-sized chunks. `OLLAMA_KEEP_ALIVE=-1m` keeps the model resident; change it if persistent GPU memory use is undesirable.
-- Every request budgets for native tool schemas, output, and chat-template overhead. `CONTEXT_CHAR_LIMIT` optionally lowers the automatic input ceiling; text is counted in UTF-8 bytes. Old exchanges are removed as complete groups before reference catalogs or current content are shortened. Core rules and custom instructions stay intact, and custom-instruction edits refresh on the next model call. Edits that leave insufficient request space are rejected before saving.
+- Tool chains continue until the model returns a final response or `no_response`. Context compaction, individual request timeouts, tool argument validation, and Discord rate limits still apply.
+- Fast local defaults use `qwen3.5:4b` and a 16,384-token context. Responses are not generation-capped and are split into Discord-sized chunks.
+- Every request budgets for AI SDK tool schemas, output, and chat-template overhead. `CONTEXT_CHAR_LIMIT` optionally lowers the automatic input ceiling; text is counted in UTF-8 bytes. Old exchanges are removed before reference catalogs or current content are shortened. Core rules and custom instructions stay intact, and custom-instruction edits refresh on the next model call. Edits that leave insufficient request space are rejected before saving.
 - Token and image costs vary by model: context overflow retries with a smaller input budget, then reports an actionable message if the core instructions and current exchange cannot fit. It does not increase the configured context or GPU allocation automatically.
 - Discord tool summaries include bounded parameters, with existing prompt/memory log compaction retained. The latest human message's standalone `sudo` command overrides prompt instructions for that message; application tool validation and Discord permissions still apply.
 - Member catalogs prioritize recent participants and named members (20 entries); emoji catalogs include up to 30 entries. Tools can resolve members outside the supplied catalog.
